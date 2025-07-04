@@ -40,7 +40,7 @@ from hummingbot.logger import HummingbotLogger
 from hummingbot.logger.application_warning import ApplicationWarning
 from hummingbot.model.sql_connection_manager import SQLConnectionManager
 from hummingbot.notifier.notifier_base import NotifierBase
-from hummingbot.remote_iface.mqtt import MQTTGateway
+# from hummingbot.remote_iface.mqtt import MQTTGateway  # Temporarily disabled due to pydantic conflict
 from hummingbot.strategy.maker_taker_market_pair import MakerTakerMarketPair
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.strategy_base import StrategyBase
@@ -107,7 +107,7 @@ class HummingbotApplication(*commands):
         self._pmm_script_iterator = None
         self._binance_connector = None
         self._shared_client = None
-        self._mqtt: MQTTGateway = None
+        # self._mqtt: MQTTGateway = None  # Temporarily disabled
 
         # gateway variables and monitor
         self._gateway_monitor = GatewayStatusMonitor(self)
@@ -123,9 +123,9 @@ class HummingbotApplication(*commands):
         )
 
         self._init_gateway_monitor()
-        # MQTT Bridge
-        if self.client_config_map.mqtt_bridge.mqtt_autostart:
-            self.mqtt_start()
+        # MQTT Bridge - Temporarily disabled due to pydantic conflict
+        # if self.client_config_map.mqtt_bridge.mqtt_autostart:
+        #     self.mqtt_start()
 
     @property
     def instance_id(self) -> str:
@@ -328,8 +328,8 @@ class HummingbotApplication(*commands):
             self.client_config_map.market_data_collection,
         )
         self.markets_recorder.start()
-        if self._mqtt is not None:
-            self._mqtt.start_market_events_fw()
+        # if self._mqtt is not None:  # Temporarily disabled
+        #     self._mqtt.start_market_events_fw()
 
     def _initialize_notifiers(self):
         for notifier in self.notifiers:

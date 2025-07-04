@@ -8,7 +8,7 @@ from .gateway_command import GatewayCommand
 from .help_command import HelpCommand
 from .history_command import HistoryCommand
 from .import_command import ImportCommand
-from .mqtt_command import MQTTCommand
+# from .mqtt_command import MQTTCommand  # Temporarily disabled due to pydantic conflict
 from .order_book_command import OrderBookCommand
 from .previous_strategy_command import PreviousCommand
 from .rate_command import RateCommand
@@ -37,5 +37,5 @@ __all__ = [
     StatusCommand,
     StopCommand,
     TickerCommand,
-    MQTTCommand,
+    # MQTTCommand,  # Temporarily disabled
 ]
