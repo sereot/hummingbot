@@ -1,0 +1,39 @@
+# VALR Test Bot Configuration
+# This configuration file provides an example setup for testing VALR order placement
+
+# Exchange Configuration
+exchange: "valr"
+trading_pair: "DOGE-USDT"
+
+# Order Configuration
+order_amount: 4        # Minimum amount for DOGEUSDT on VALR: 4 DOGE
+bid_spread: 0.01       # 100 bps (1%) below mid price
+ask_spread: 0.01       # 100 bps (1%) above mid price
+
+# Timing Configuration
+order_refresh_time: 30  # Refresh orders every 30 seconds
+
+# Price Source
+price_type: "mid"  # Use mid price as reference (options: "mid", "last")
+
+# Order Type Configuration
+use_post_only: true  # Use LIMIT_MAKER orders (post-only) for safety
+
+# Testing Notes:
+# - DOGE-USDT pair is ACTIVE and available on VALR ✅
+# - 100 bps spread ensures orders won't be filled during testing
+# - Minimum order amount (4 DOGE) reduces risk
+# - 30-second refresh provides good visibility for testing
+# - Post-only orders prevent accidental market orders
+
+# VALR Trading Rules for DOGEUSDT:
+# - Symbol: "DOGEUSDT"
+# - Min Base Amount: 4 DOGE
+# - Max Base Amount: 680,000 DOGE
+# - Min Quote Amount: 0.5 USDT
+# - Max Quote Amount: 54,000 USDT
+# - Tick Size: 0.00001 USDT
+# - Base Decimal Places: 1
+# - Active: true ✅
+# - Margin Trading Allowed: true
+# - Currency Pair Type: SPOT
