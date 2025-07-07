@@ -36,4 +36,4 @@ class ExitCommand:
             notifier.stop()
 
         self.app.exit()
-        self.mqtt_stop()
+        # self.mqtt_stop()  # MQTT functionality temporarily disabled

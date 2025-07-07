@@ -154,18 +154,18 @@ class ValrExchange(ExchangePyBase):
         Initialize trading pair symbols from exchange info.
         VALR provides pairs info in a list format.
         """
+        mapping = {}
         if isinstance(exchange_info, list):
             for pair_info in exchange_info:
                 if self._is_pair_valid_for_trading(pair_info):
                     exchange_symbol = pair_info.get("symbol", "")
                     try:
                         trading_pair = web_utils.convert_from_exchange_trading_pair(exchange_symbol)
-                        self._set_trading_pair_symbol_map(
-                            exchange_symbol=exchange_symbol,
-                            trading_pair=trading_pair
-                        )
+                        mapping[exchange_symbol] = trading_pair
                     except Exception:
                         self.logger().exception(f"Error processing trading pair {exchange_symbol}")
+        
+        self._set_trading_pair_symbol_map(mapping)
 
     def _get_fee(
         self,
@@ -268,7 +268,11 @@ class ValrExchange(ExchangePyBase):
                 if not self._is_pair_valid_for_trading(pair_info):
                     continue
                     
-                trading_pair = web_utils.convert_from_exchange_trading_pair(pair_info["symbol"])
+                symbol = pair_info.get("symbol")
+                if not symbol:
+                    self.logger().warning(f"Missing symbol in pair info: {pair_info}")
+                    continue
+                trading_pair = web_utils.convert_from_exchange_trading_pair(symbol)
                 
                 trading_rules.append(
                     TradingRule(
@@ -344,13 +348,47 @@ class ValrExchange(ExchangePyBase):
         try:
             balances = event_message.get("data", {})
             
+            # Validate balances format
+            if not isinstance(balances, list):
+                self.logger().warning(f"Expected list for balance data, got {type(balances)}: {balances}")
+                return
+            
             for currency_data in balances:
-                asset = currency_data["currency"]["currencyCode"]
-                available = Decimal(str(currency_data["available"]))
-                total = Decimal(str(currency_data["balance"]))
-                
-                self._account_available_balances[asset] = available
-                self._account_balances[asset] = total
+                try:
+                    # Validate currency_data structure
+                    if not isinstance(currency_data, dict):
+                        self.logger().warning(f"Invalid currency data format: {currency_data}")
+                        continue
+                    
+                    # Handle currency field - VALR returns it as a string, not a dict
+                    currency_info = currency_data.get("currency")
+                    if isinstance(currency_info, dict):
+                        # Handle nested currency object (future compatibility)
+                        asset = currency_info.get("currencyCode")
+                    elif isinstance(currency_info, str):
+                        # Handle direct currency string (VALR's actual format)
+                        asset = currency_info
+                    else:
+                        self.logger().warning(f"Unknown currency format in balance data: {currency_data}")
+                        continue
+                    
+                    available = currency_data.get("available")
+                    # VALR uses 'total' field name, not 'balance'
+                    total = currency_data.get("total", currency_data.get("balance"))
+                    
+                    # Validate required fields
+                    if not asset or available is None or total is None:
+                        self.logger().warning(f"Missing required fields in currency data: {currency_data}")
+                        continue
+                    
+                    available = Decimal(str(available))
+                    total = Decimal(str(total))
+                    
+                    self._account_available_balances[asset] = available
+                    self._account_balances[asset] = total
+                    
+                except Exception as e:
+                    self.logger().error(f"Error processing individual balance data {currency_data}: {e}")
                 
         except Exception:
             self.logger().exception("Error processing balance update")
@@ -469,13 +507,47 @@ class ValrExchange(ExchangePyBase):
         self._account_available_balances.clear()
         self._account_balances.clear()
         
-        for balance_data in response:
-            asset = balance_data["currency"]["currencyCode"]
-            available = Decimal(str(balance_data["available"]))
-            total = Decimal(str(balance_data["balance"]))
+        # Validate response format
+        if not isinstance(response, list):
+            self.logger().error(f"Expected list response for balances, got {type(response)}: {response}")
+            return
             
-            self._account_available_balances[asset] = available
-            self._account_balances[asset] = total
+        for balance_data in response:
+            try:
+                # Validate balance_data structure
+                if not isinstance(balance_data, dict):
+                    self.logger().warning(f"Invalid balance data format: {balance_data}")
+                    continue
+                
+                # Handle currency field - VALR returns it as a string, not a dict
+                currency_info = balance_data.get("currency")
+                if isinstance(currency_info, dict):
+                    # Handle nested currency object (future compatibility)
+                    asset = currency_info.get("currencyCode")
+                elif isinstance(currency_info, str):
+                    # Handle direct currency string (VALR's actual format)
+                    asset = currency_info
+                else:
+                    self.logger().warning(f"Unknown currency format in balance data: {balance_data}")
+                    continue
+                
+                available = balance_data.get("available")
+                # VALR uses 'total' field name, not 'balance'
+                total = balance_data.get("total", balance_data.get("balance"))
+                
+                # Validate required fields
+                if not asset or available is None or total is None:
+                    self.logger().warning(f"Missing required fields in balance data: {balance_data}")
+                    continue
+                
+                available = Decimal(str(available))
+                total = Decimal(str(total))
+                
+                self._account_available_balances[asset] = available
+                self._account_balances[asset] = total
+                
+            except Exception as e:
+                self.logger().error(f"Error processing balance data {balance_data}: {e}")
 
     async def _request_order_update(self, order: InFlightOrder) -> OrderUpdate:
         """

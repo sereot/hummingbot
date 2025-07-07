@@ -126,7 +126,13 @@ async def get_current_server_time(
     )
     
     # VALR returns time in milliseconds
-    server_time_ms = response["epochTime"]
+    if not isinstance(response, dict):
+        raise ValueError(f"Expected dict response for server time, got {type(response)}: {response}")
+    
+    server_time_ms = response.get("epochTime")
+    if server_time_ms is None:
+        raise ValueError(f"Missing epochTime in server response: {response}")
+    
     return server_time_ms / 1000.0  # Convert to seconds
 
 
