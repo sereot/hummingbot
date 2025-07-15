@@ -10,6 +10,29 @@ from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.api_throttler.data_types import RateLimit
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RESTRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+from hummingbot.core.web_assistant.rest_pre_processors import RESTPreProcessorBase
+
+
+class _RESTPreProcessor(RESTPreProcessorBase):
+    """
+    Pre-processor to add required headers for VALR API requests.
+    """
+    
+    async def pre_process(self, request: RESTRequest) -> RESTRequest:
+        """
+        Add required headers to the request.
+        VALR requires all REST requests to use application/json content-type.
+        """
+        if request.headers is None:
+            request.headers = {}
+            
+        # Add required Content-Type header for VALR API
+        request.headers["Content-Type"] = "application/json"
+        
+        # Add User-Agent to prevent blocking
+        request.headers["User-Agent"] = "HummingbotClient/1.0"
+        
+        return request
 
 
 def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
@@ -66,12 +89,16 @@ def build_api_factory(
         domain=domain,
     ))
     
+    # Create rest pre-processor that adds required headers
+    rest_pre_processors = [
+        TimeSynchronizerRESTPreProcessor(synchronizer=time_synchronizer, time_provider=time_provider),
+        _RESTPreProcessor(),
+    ]
+    
     api_factory = WebAssistantsFactory(
         throttler=throttler,
         auth=auth,
-        rest_pre_processors=[
-            TimeSynchronizerRESTPreProcessor(synchronizer=time_synchronizer, time_provider=time_provider),
-        ],
+        rest_pre_processors=rest_pre_processors,
     )
     return api_factory
 
@@ -92,9 +119,13 @@ def build_api_factory_without_time_synchronizer_pre_processor(
     Returns:
         A WebAssistantsFactory instance
     """
+    # Add rest pre-processor for required headers
+    rest_pre_processors = [_RESTPreProcessor()]
+    
     api_factory = WebAssistantsFactory(
         throttler=throttler,
         auth=auth,
+        rest_pre_processors=rest_pre_processors,
     )
     return api_factory
 

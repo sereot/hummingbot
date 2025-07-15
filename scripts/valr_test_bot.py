@@ -1,7 +1,7 @@
 import logging
 import os
 from decimal import Decimal
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from pydantic import Field
 
@@ -55,23 +55,30 @@ class ValrTestBot(ScriptStrategyBase):
 
     create_timestamp = 0
     price_source = PriceType.MidPrice
+    markets = {"valr": {"DOGE-USDT"}}
 
     @classmethod
-    def init_markets(cls, config: ValrTestBotConfig):
+    def init_markets(cls, config: Optional[ValrTestBotConfig] = None):
+        if config is None:
+            config = ValrTestBotConfig()
         cls.markets = {config.exchange: {config.trading_pair}}
         cls.price_source = PriceType.LastTrade if config.price_type == "last" else PriceType.MidPrice
 
-    def __init__(self, connectors: Dict[str, ConnectorBase], config: ValrTestBotConfig):
+    def __init__(self, connectors: Dict[str, ConnectorBase], config: Optional[ValrTestBotConfig] = None):
         super().__init__(connectors)
-        self.config = config
+        # Use provided config or create default
+        if config is None:
+            self.config = ValrTestBotConfig()
+        else:
+            self.config = config
         self.websocket_test_completed = False
         
         # Log initialization
         self.log_with_clock(
             logging.INFO, 
-            f"VALR Test Bot initialized - Pair: {config.trading_pair}, "
-            f"Exchange: {config.exchange}, Spread: {config.bid_spread*100}%, "
-            f"Order Amount: {config.order_amount} DOGE"
+            f"VALR Test Bot initialized - Pair: {self.config.trading_pair}, "
+            f"Exchange: {self.config.exchange}, Spread: {self.config.bid_spread*100}%, "
+            f"Order Amount: {self.config.order_amount} DOGE"
         )
 
     def on_tick(self):

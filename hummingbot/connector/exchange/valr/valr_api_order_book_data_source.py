@@ -36,6 +36,11 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._api_factory = api_factory
         self._domain = domain
         self._trading_pairs = trading_pairs
+        
+        # Set up proper queue keys for base class integration
+        self._trade_messages_queue_key = CONSTANTS.WS_MARKET_TRADE_EVENT
+        self._diff_messages_queue_key = CONSTANTS.WS_MARKET_AGGREGATED_ORDERBOOK_UPDATE_EVENT
+        self._snapshot_messages_queue_key = CONSTANTS.WS_MARKET_FULL_ORDERBOOK_SNAPSHOT_EVENT
 
     async def get_last_traded_prices(
         self, trading_pairs: List[str], domain: Optional[str] = None
@@ -74,15 +79,15 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 
         return results
 
-    async def _get_snapshot(self, trading_pair: str) -> Dict[str, Any]:
+    async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
         """
-        Get orderbook snapshot for a trading pair.
+        Retrieves a copy of the full order book from the exchange, for a particular trading pair.
         
         Args:
-            trading_pair: The trading pair to get snapshot for
+            trading_pair: The trading pair for which the order book will be retrieved
             
         Returns:
-            The orderbook snapshot data
+            The response from the exchange (JSON dictionary)
         """
         rest_assistant = await self._api_factory.get_rest_assistant()
         exchange_pair = web_utils.convert_to_exchange_trading_pair(trading_pair)
@@ -100,241 +105,136 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
         
         return snapshot
 
-    async def get_order_book_data(self, trading_pair: str) -> Dict[str, Any]:
+    async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
         """
-        Get order book data for a trading pair.
+        Creates an OrderBookMessage containing the snapshot information from the exchange.
         
         Args:
-            trading_pair: The trading pair to get order book for
+            trading_pair: The trading pair for which to get the snapshot
             
         Returns:
-            The order book data including snapshot
+            OrderBookMessage with snapshot data
         """
-        snapshot = await self._get_snapshot(trading_pair)
+        snapshot = await self._request_order_book_snapshot(trading_pair)
         
-        # Add required metadata
-        snapshot["trading_pair"] = trading_pair
-        snapshot["timestamp"] = time.time()
+        # Create snapshot message
+        snapshot_msg = OrderBookMessage(
+            message_type=OrderBookMessageType.SNAPSHOT,
+            content={
+                "trading_pair": trading_pair,
+                "bids": snapshot.get("Bids", []),
+                "asks": snapshot.get("Asks", []),
+                "update_id": int(time.time() * 1e3),
+                "timestamp": time.time(),
+            },
+            timestamp=time.time(),
+        )
         
-        return snapshot
+        return snapshot_msg
 
-    async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+    async def _connected_websocket_assistant(self) -> WSAssistant:
         """
-        Listen for orderbook snapshots via REST API.
+        Creates a websocket assistant connected to the exchange's WebSocket endpoint.
+        Required by the base class.
+        
+        Returns:
+            A websocket assistant instance connected to the exchange
         """
-        while True:
-            try:
-                for trading_pair in self._trading_pairs:
-                    try:
-                        snapshot = await self._get_snapshot(trading_pair)
-                        
-                        # Create snapshot message
-                        snapshot_msg = OrderBookMessage(
-                            message_type=OrderBookMessageType.SNAPSHOT,
-                            content={
-                                "trading_pair": trading_pair,
-                                "bids": snapshot.get("Bids", []),
-                                "asks": snapshot.get("Asks", []),
-                                "update_id": int(time.time() * 1e3),
-                                "timestamp": time.time(),
-                            },
-                            timestamp=time.time(),
-                        )
-                        
-                        output.put_nowait(snapshot_msg)
-                        
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        self.logger().exception(
-                            f"Error fetching snapshot for {trading_pair}. Retrying after {self.HEARTBEAT_TIME_INTERVAL} seconds..."
-                        )
-                        
-                await self._sleep(self.FULL_ORDER_BOOK_RESET_DELTA_SECONDS)
-                
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.logger().exception(
-                    "Unexpected error in order book snapshot listener. Retrying after 5 seconds..."
-                )
-                await self._sleep(5.0)
+        ws_assistant = await self._api_factory.get_ws_assistant()
+        
+        # Connect to the WebSocket endpoint
+        await ws_assistant.connect(
+            ws_url=CONSTANTS.WSS_TRADE_URL,
+            ping_timeout=CONSTANTS.PING_TIMEOUT
+        )
+        
+        return ws_assistant
 
-    async def listen_for_order_book_diffs(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+    async def _subscribe_channels(self, ws: WSAssistant):
         """
-        Listen for orderbook updates via WebSocket.
+        Subscribes to the trade events and diff orders events through the provided websocket connection.
+        Required by the base class.
+        
+        Args:
+            ws: The websocket assistant used to connect to the exchange
         """
-        while True:
-            try:
-                ws_assistant = await self._get_ws_assistant()
-                await ws_assistant.connect(
-                    ws_url=CONSTANTS.WSS_TRADE_URL,
-                    ping_timeout=CONSTANTS.PING_TIMEOUT
-                )
-                
-                # Subscribe to orderbook updates for all trading pairs
-                await self._subscribe_to_order_book_streams(ws_assistant)
-                
-                async for ws_response in ws_assistant.iter_messages():
-                    data = ws_response.data
-                    
-                    if data.get("type") == CONSTANTS.WS_MARKET_AGGREGATED_ORDERBOOK_UPDATE_EVENT:
-                        await self._process_order_book_diff(data, output)
-                    elif data.get("type") == CONSTANTS.WS_MARKET_FULL_ORDERBOOK_SNAPSHOT_EVENT:
-                        await self._process_order_book_snapshot(data, output)
-                        
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.logger().exception(
-                    "Unexpected error in order book diff listener. Retrying after 5 seconds..."
-                )
-                await self._sleep(5.0)
-            finally:
-                await ws_assistant.disconnect()
-
-    async def listen_for_trades(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
-        """
-        Listen for trades via WebSocket.
-        """
-        while True:
-            try:
-                ws_assistant = await self._get_ws_assistant()
-                await ws_assistant.connect(
-                    ws_url=CONSTANTS.WSS_TRADE_URL,
-                    ping_timeout=CONSTANTS.PING_TIMEOUT
-                )
-                
-                # Subscribe to trade streams for all trading pairs
-                await self._subscribe_to_trade_streams(ws_assistant)
-                
-                async for ws_response in ws_assistant.iter_messages():
-                    data = ws_response.data
-                    
-                    if data.get("type") == CONSTANTS.WS_MARKET_TRADE_EVENT:
-                        await self._process_trade_message(data, output)
-                        
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.logger().exception(
-                    "Unexpected error in trades listener. Retrying after 5 seconds..."
-                )
-                await self._sleep(5.0)
-            finally:
-                await ws_assistant.disconnect()
-
-    async def _get_ws_assistant(self) -> WSAssistant:
-        """Get or create a WebSocket assistant."""
-        if self._ws_assistant is None:
-            self._ws_assistant = await self._api_factory.get_ws_assistant()
-        return self._ws_assistant
-
-    async def _subscribe_to_order_book_streams(self, ws_assistant: WSAssistant):
-        """Subscribe to orderbook update streams for all trading pairs."""
-        for trading_pair in self._trading_pairs:
-            exchange_pair = web_utils.convert_to_exchange_trading_pair(trading_pair)
-            
-            # Subscribe to aggregated orderbook updates
-            subscribe_request = WSJSONRequest({
-                "type": CONSTANTS.WS_SUBSCRIBE_EVENT,
-                "subscriptions": [{
-                    "event": "AGGREGATED_ORDERBOOK_UPDATE",
-                    "pairs": [exchange_pair]
-                }]
-            })
-            
-            await ws_assistant.send(subscribe_request)
-            
-    async def _subscribe_to_trade_streams(self, ws_assistant: WSAssistant):
-        """Subscribe to trade streams for all trading pairs."""
-        for trading_pair in self._trading_pairs:
-            exchange_pair = web_utils.convert_to_exchange_trading_pair(trading_pair)
-            
-            # Subscribe to trade updates
-            subscribe_request = WSJSONRequest({
-                "type": CONSTANTS.WS_SUBSCRIBE_EVENT,
-                "subscriptions": [{
-                    "event": "NEW_TRADE",
-                    "pairs": [exchange_pair]
-                }]
-            })
-            
-            await ws_assistant.send(subscribe_request)
-
-    async def _process_order_book_diff(self, data: Dict[str, Any], output: asyncio.Queue):
-        """Process orderbook diff message."""
         try:
-            pair = data.get("currencyPairSymbol", "")
-            trading_pair = web_utils.convert_from_exchange_trading_pair(pair)
-            
-            if trading_pair not in self._trading_pairs:
-                return
+            for trading_pair in self._trading_pairs:
+                exchange_pair = web_utils.convert_to_exchange_trading_pair(trading_pair)
                 
-            # Extract bids and asks
-            bids = data.get("Bids", [])
-            asks = data.get("Asks", [])
+                # Subscribe to aggregated orderbook updates
+                orderbook_subscribe_request = WSJSONRequest({
+                    "type": CONSTANTS.WS_SUBSCRIBE_EVENT,
+                    "subscriptions": [{
+                        "event": "AGGREGATED_ORDERBOOK_UPDATE",
+                        "pairs": [exchange_pair]
+                    }]
+                })
+                
+                # Subscribe to trade updates
+                trade_subscribe_request = WSJSONRequest({
+                    "type": CONSTANTS.WS_SUBSCRIBE_EVENT,
+                    "subscriptions": [{
+                        "event": "NEW_TRADE",
+                        "pairs": [exchange_pair]
+                    }]
+                })
+                
+                await ws.send(orderbook_subscribe_request)
+                await ws.send(trade_subscribe_request)
+                
+            self.logger().info("Subscribed to public order book and trade channels...")
             
-            # Create diff message
-            diff_msg = OrderBookMessage(
-                message_type=OrderBookMessageType.DIFF,
-                content={
-                    "trading_pair": trading_pair,
-                    "bids": bids,
-                    "asks": asks,
-                    "update_id": data.get("SequenceNumber", int(time.time() * 1e3)),
-                    "timestamp": time.time(),
-                },
-                timestamp=time.time(),
-            )
-            
-            output.put_nowait(diff_msg)
-            
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            self.logger().exception("Error processing order book diff message")
-
-    async def _process_order_book_snapshot(self, data: Dict[str, Any], output: asyncio.Queue):
-        """Process full orderbook snapshot message."""
-        try:
-            pair = data.get("currencyPairSymbol", "")
-            trading_pair = web_utils.convert_from_exchange_trading_pair(pair)
-            
-            if trading_pair not in self._trading_pairs:
-                return
-                
-            # Extract bids and asks
-            bids = data.get("Bids", [])
-            asks = data.get("Asks", [])
-            
-            # Create snapshot message
-            snapshot_msg = OrderBookMessage(
-                message_type=OrderBookMessageType.SNAPSHOT,
-                content={
-                    "trading_pair": trading_pair,
-                    "bids": bids,
-                    "asks": asks,
-                    "update_id": data.get("SequenceNumber", int(time.time() * 1e3)),
-                    "timestamp": time.time(),
-                },
-                timestamp=time.time(),
+            self.logger().error(
+                "Unexpected error occurred subscribing to order book trading and delta streams...",
+                exc_info=True
             )
-            
-            output.put_nowait(snapshot_msg)
-            
-        except Exception:
-            self.logger().exception("Error processing order book snapshot message")
+            raise
 
-    async def _process_trade_message(self, data: Dict[str, Any], output: asyncio.Queue):
-        """Process trade message."""
+    def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
+        """
+        Identifies the channel for a particular event message. Used to find the correct queue to add the message in.
+        Required by the base class.
+        
+        Args:
+            event_message: The event received through the websocket connection
+            
+        Returns:
+            The message channel
+        """
+        channel = ""
+        event_type = event_message.get("type", "")
+        
+        if event_type == CONSTANTS.WS_MARKET_TRADE_EVENT:
+            channel = self._trade_messages_queue_key
+        elif event_type == CONSTANTS.WS_MARKET_AGGREGATED_ORDERBOOK_UPDATE_EVENT:
+            channel = self._diff_messages_queue_key
+        elif event_type == CONSTANTS.WS_MARKET_FULL_ORDERBOOK_SNAPSHOT_EVENT:
+            channel = self._snapshot_messages_queue_key
+            
+        return channel
+
+    async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+        """
+        Create an instance of OrderBookMessage of type OrderBookMessageType.TRADE
+        Required by the base class.
+        
+        Args:
+            raw_message: The JSON dictionary of the public trade event
+            message_queue: Queue where the parsed messages should be stored in
+        """
         try:
-            pair = data.get("currencyPair", "")
+            pair = raw_message.get("currencyPair", "")
             trading_pair = web_utils.convert_from_exchange_trading_pair(pair)
             
             if trading_pair not in self._trading_pairs:
                 return
             
             # Determine trade type
-            side = data.get("takerSide", "").upper()
+            side = raw_message.get("takerSide", "").upper()
             trade_type = TradeType.BUY if side == "BUY" else TradeType.SELL
             
             # Create trade message
@@ -343,15 +243,91 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 content={
                     "trading_pair": trading_pair,
                     "trade_type": float(trade_type.value),
-                    "trade_id": data.get("id", ""),
-                    "price": data.get("price", "0"),
-                    "amount": data.get("quantity", "0"),
-                    "timestamp": data.get("tradedAt", time.time()),
+                    "trade_id": raw_message.get("id", ""),
+                    "price": raw_message.get("price", "0"),
+                    "amount": raw_message.get("quantity", "0"),
+                    "timestamp": raw_message.get("tradedAt", time.time()),
                 },
                 timestamp=time.time(),
             )
             
-            output.put_nowait(trade_msg)
+            message_queue.put_nowait(trade_msg)
             
         except Exception:
             self.logger().exception("Error processing trade message")
+
+    async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+        """
+        Create an instance of OrderBookMessage of type OrderBookMessageType.DIFF
+        Required by the base class.
+        
+        Args:
+            raw_message: The JSON dictionary of the public order book diff event
+            message_queue: Queue where the parsed messages should be stored in
+        """
+        try:
+            pair = raw_message.get("currencyPairSymbol", "")
+            trading_pair = web_utils.convert_from_exchange_trading_pair(pair)
+            
+            if trading_pair not in self._trading_pairs:
+                return
+                
+            # Extract bids and asks
+            bids = raw_message.get("Bids", [])
+            asks = raw_message.get("Asks", [])
+            
+            # Create diff message
+            diff_msg = OrderBookMessage(
+                message_type=OrderBookMessageType.DIFF,
+                content={
+                    "trading_pair": trading_pair,
+                    "bids": bids,
+                    "asks": asks,
+                    "update_id": raw_message.get("SequenceNumber", int(time.time() * 1e3)),
+                    "timestamp": time.time(),
+                },
+                timestamp=time.time(),
+            )
+            
+            message_queue.put_nowait(diff_msg)
+            
+        except Exception:
+            self.logger().exception("Error processing order book diff message")
+
+    async def _parse_order_book_snapshot_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+        """
+        Create an instance of OrderBookMessage of type OrderBookMessageType.SNAPSHOT
+        Required by the base class.
+        
+        Args:
+            raw_message: The JSON dictionary of the public order book snapshot event
+            message_queue: Queue where the parsed messages should be stored in
+        """
+        try:
+            pair = raw_message.get("currencyPairSymbol", "")
+            trading_pair = web_utils.convert_from_exchange_trading_pair(pair)
+            
+            if trading_pair not in self._trading_pairs:
+                return
+                
+            # Extract bids and asks
+            bids = raw_message.get("Bids", [])
+            asks = raw_message.get("Asks", [])
+            
+            # Create snapshot message
+            snapshot_msg = OrderBookMessage(
+                message_type=OrderBookMessageType.SNAPSHOT,
+                content={
+                    "trading_pair": trading_pair,
+                    "bids": bids,
+                    "asks": asks,
+                    "update_id": raw_message.get("SequenceNumber", int(time.time() * 1e3)),
+                    "timestamp": time.time(),
+                },
+                timestamp=time.time(),
+            )
+            
+            message_queue.put_nowait(snapshot_msg)
+            
+        except Exception:
+            self.logger().exception("Error processing order book snapshot message")

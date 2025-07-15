@@ -107,7 +107,7 @@ class HummingbotApplication(*commands):
         self._pmm_script_iterator = None
         self._binance_connector = None
         self._shared_client = None
-        # self._mqtt: MQTTGateway = None  # Temporarily disabled
+        self._mqtt = None  # Initialize _mqtt attribute to prevent AttributeError
 
         # gateway variables and monitor
         self._gateway_monitor = GatewayStatusMonitor(self)

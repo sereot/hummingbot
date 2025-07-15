@@ -37,21 +37,18 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """
-        Creates an authenticated connection to the user account WebSocket.
+        Creates an authenticated connection to the user account WebSocket with rate limiting support.
         
         Returns:
             An authenticated WSAssistant instance
         """
         ws_assistant = await self._api_factory.get_ws_assistant()
         
-        # Connect to account WebSocket
-        await ws_assistant.connect(
-            ws_url=CONSTANTS.WSS_ACCOUNT_URL,
-            ping_timeout=self.PING_TIMEOUT
-        )
+        # Connect to account WebSocket with retry logic for rate limiting
+        await self._connect_with_retry(ws_assistant, CONSTANTS.WSS_ACCOUNT_URL)
         
         # Send authentication message after connection
-        auth_payload = self._auth.get_ws_auth_payload()
+        auth_payload = self._auth.get_ws_auth_payload("/ws/account")
         auth_request = WSJSONRequest(auth_payload)
         await ws_assistant.send(auth_request)
         
@@ -65,6 +62,48 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 raise IOError(f"User stream authentication failed: {data.get('message', 'Unknown error')}")
         
         return ws_assistant
+
+    async def _connect_with_retry(self, ws_assistant: WSAssistant, ws_url: str, max_retries: int = 5):
+        """
+        Connect to WebSocket with exponential backoff for rate limiting.
+        
+        Args:
+            ws_assistant: The WebSocket assistant to connect
+            ws_url: The WebSocket URL to connect to
+            max_retries: Maximum number of retry attempts
+        """
+        import random
+        
+        for attempt in range(max_retries):
+            try:
+                await ws_assistant.connect(
+                    ws_url=ws_url,
+                    ping_timeout=self.PING_TIMEOUT
+                )
+                return  # Success
+                
+            except Exception as e:
+                error_msg = str(e)
+                
+                # Check for rate limiting (429 errors)
+                if "429" in error_msg or "Too Many Requests" in error_msg:
+                    if attempt < max_retries - 1:
+                        # Exponential backoff with jitter
+                        delay = (2 ** attempt) + random.uniform(0, 1)
+                        self.logger().warning(
+                            f"User stream WebSocket connection rate limited (429). Retrying in {delay:.1f}s... "
+                            f"(attempt {attempt + 1}/{max_retries})"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        self.logger().error(
+                            f"User stream WebSocket connection failed after {max_retries} attempts due to rate limiting"
+                        )
+                        raise
+                else:
+                    # For non-rate-limiting errors, raise immediately
+                    raise
 
     async def _subscribe_channels(self, websocket_assistant: WSAssistant):
         """
@@ -94,6 +133,7 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
             output: The queue to place received messages
         """
         while True:
+            ws_assistant = None
             try:
                 ws_assistant = await self._connected_websocket_assistant()
                 await self._subscribe_channels(ws_assistant)
@@ -128,7 +168,8 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 )
                 await self._sleep(5.0)
             finally:
-                ws_assistant and await ws_assistant.disconnect()
+                if ws_assistant is not None:
+                    await ws_assistant.disconnect()
 
     async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
         """

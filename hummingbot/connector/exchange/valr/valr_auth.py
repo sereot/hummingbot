@@ -130,20 +130,31 @@ class ValrAuth(AuthBase):
         request.headers = headers
         return request
 
-    def get_ws_auth_payload(self) -> Dict[str, Any]:
+    def get_ws_auth_payload(self, ws_path: str = "/ws/account") -> Dict[str, Any]:
         """
         Gets the authentication payload for WebSocket initial message.
-        VALR requires sending API credentials after connection.
+        VALR requires sending API credentials with proper HMAC signature after connection.
         
+        Args:
+            ws_path: The WebSocket path being authenticated (/ws/account or /ws/trade)
+            
         Returns:
-            Dictionary with authentication data
+            Dictionary with authentication data including signature
         """
         timestamp = int(time.time() * 1000)
         
+        # For WebSocket authentication, VALR requires signing the WebSocket connection path
+        # The signature is generated similar to REST API calls
+        verb = "GET"
+        body = ""
+        
+        signature = self._generate_signature(timestamp, verb, ws_path, body)
+        
         return {
-            "type": "AUTHENTICATE",
+            "type": "AUTHENTICATE", 
             "apiKey": self._api_key,
-            "timestamp": timestamp
+            "timestamp": timestamp,
+            "signature": signature
         }
 
     def generate_auth_dict(
