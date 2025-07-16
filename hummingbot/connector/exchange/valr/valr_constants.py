@@ -19,7 +19,7 @@ TICKER_PRICE_PATH_URL = "/v1/public/marketsummary"
 TICKER_PRICE_CHANGE_PATH_URL = "/v1/public/marketsummary"
 EXCHANGE_INFO_PATH_URL = "/v1/public/currencies"
 PING_PATH_URL = "/v1/public/time"
-SNAPSHOT_PATH_URL = "/v1/marketdata/{}/orderbook"
+SNAPSHOT_PATH_URL = "/v1/public/{}/orderbook"
 SERVER_TIME_PATH_URL = "/v1/public/time"
 PAIRS_PATH_URL = "/v1/public/pairs"
 

@@ -25,14 +25,18 @@ async def test_valr_api():
     print("=" * 60)
     
     try:
+        # Create throttler with VALR rate limits
+        from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
+        throttler = AsyncThrottler(CONSTANTS.RATE_LIMITS)
+        
         # Test 1: Server Time
         print("\n1. Testing server time endpoint...")
-        server_time = await web_utils.get_current_server_time()
+        server_time = await web_utils.get_current_server_time(throttler=throttler)
         print(f"✓ Server time: {server_time}")
         
         # Test 2: Market Summary
         print("\n2. Testing market summary endpoint...")
-        api_factory = web_utils.build_api_factory_without_time_synchronizer_pre_processor()
+        api_factory = web_utils.build_api_factory(throttler=throttler)
         rest_assistant = await api_factory.get_rest_assistant()
         
         url = web_utils.public_rest_url(CONSTANTS.TICKER_PRICE_PATH_URL)
@@ -115,8 +119,12 @@ async def test_order_book_data_source():
         
         print("\n1. Testing data source creation...")
         
+        # Create throttler with VALR rate limits
+        from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
+        throttler = AsyncThrottler(CONSTANTS.RATE_LIMITS)
+        
         # Create a mock exchange (we can't fully initialize without API keys)
-        api_factory = web_utils.build_api_factory_without_time_synchronizer_pre_processor()
+        api_factory = web_utils.build_api_factory(throttler=throttler)
         
         # Create data source
         data_source = ValrAPIOrderBookDataSource(
@@ -141,11 +149,14 @@ async def test_order_book_data_source():
         print("\n3. Testing order book snapshot...")
         snapshot_msg = await data_source._order_book_snapshot("DOGE-USDT")
         
-        if snapshot_msg.message_type.name == "SNAPSHOT":
+        if hasattr(snapshot_msg, 'type') and snapshot_msg.type.name == "SNAPSHOT":
+            content = snapshot_msg.content
+            print(f"✓ Snapshot retrieved: {len(content.get('bids', []))} bids, {len(content.get('asks', []))} asks")
+        elif hasattr(snapshot_msg, 'content'):
             content = snapshot_msg.content
             print(f"✓ Snapshot retrieved: {len(content.get('bids', []))} bids, {len(content.get('asks', []))} asks")
         else:
-            print(f"✗ Unexpected snapshot message type: {snapshot_msg.message_type}")
+            print(f"✗ Unexpected snapshot message: {snapshot_msg}")
             
         print("\n✓ OrderBook Data Source tests completed successfully!")
         

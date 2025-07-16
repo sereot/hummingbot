@@ -36,6 +36,7 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._api_factory = api_factory
         self._domain = domain
         self._trading_pairs = trading_pairs
+        self._ws_assistant: Optional[WSAssistant] = None
         
         # Set up proper queue keys for base class integration
         self._trade_messages_queue_key = CONSTANTS.WS_MARKET_TRADE_EVENT
@@ -117,14 +118,29 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         snapshot = await self._request_order_book_snapshot(trading_pair)
         
+        # Transform VALR API response format to Hummingbot expected format
+        # VALR returns: [{"side": "buy", "quantity": "100", "price": "0.5", ...}, ...]
+        # Hummingbot expects: [["0.5", "100"], ...]
+        
+        def transform_orders(orders):
+            """Transform VALR order format to Hummingbot format"""
+            return [[order["price"], order["quantity"]] for order in orders]
+        
+        raw_bids = snapshot.get("Bids", [])
+        raw_asks = snapshot.get("Asks", [])
+        
+        # Transform the orders to the expected format
+        bids = transform_orders(raw_bids)
+        asks = transform_orders(raw_asks)
+        
         # Create snapshot message
         snapshot_msg = OrderBookMessage(
             message_type=OrderBookMessageType.SNAPSHOT,
             content={
                 "trading_pair": trading_pair,
-                "bids": snapshot.get("Bids", []),
-                "asks": snapshot.get("Asks", []),
-                "update_id": int(time.time() * 1e3),
+                "bids": bids,
+                "asks": asks,
+                "update_id": snapshot.get("SequenceNumber", int(time.time() * 1e3)),
                 "timestamp": time.time(),
             },
             timestamp=time.time(),
@@ -149,6 +165,30 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
         )
         
         return ws_assistant
+
+    async def _get_ws_assistant(self) -> WSAssistant:
+        """
+        Creates or returns a cached websocket assistant.
+        Some base class implementations may require this method.
+        
+        Returns:
+            A websocket assistant instance
+        """
+        if not hasattr(self, '_ws_assistant') or self._ws_assistant is None:
+            self._ws_assistant = await self._connected_websocket_assistant()
+        return self._ws_assistant
+
+    async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
+        """
+        Called when the WebSocket connection is interrupted.
+        Cleanup the WebSocket assistant.
+        
+        Args:
+            websocket_assistant: The websocket assistant that was interrupted
+        """
+        self._ws_assistant = None
+        if websocket_assistant is not None:
+            await websocket_assistant.disconnect()
 
     async def _subscribe_channels(self, ws: WSAssistant):
         """
@@ -273,8 +313,16 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 return
                 
             # Extract bids and asks
-            bids = raw_message.get("Bids", [])
-            asks = raw_message.get("Asks", [])
+            raw_bids = raw_message.get("Bids", [])
+            raw_asks = raw_message.get("Asks", [])
+            
+            # Transform VALR API response format to Hummingbot expected format
+            def transform_orders(orders):
+                """Transform VALR order format to Hummingbot format"""
+                return [[order["price"], order["quantity"]] for order in orders]
+            
+            bids = transform_orders(raw_bids)
+            asks = transform_orders(raw_asks)
             
             # Create diff message
             diff_msg = OrderBookMessage(
@@ -311,8 +359,16 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 return
                 
             # Extract bids and asks
-            bids = raw_message.get("Bids", [])
-            asks = raw_message.get("Asks", [])
+            raw_bids = raw_message.get("Bids", [])
+            raw_asks = raw_message.get("Asks", [])
+            
+            # Transform VALR API response format to Hummingbot expected format
+            def transform_orders(orders):
+                """Transform VALR order format to Hummingbot format"""
+                return [[order["price"], order["quantity"]] for order in orders]
+            
+            bids = transform_orders(raw_bids)
+            asks = transform_orders(raw_asks)
             
             # Create snapshot message
             snapshot_msg = OrderBookMessage(

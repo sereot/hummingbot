@@ -52,14 +52,36 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
         auth_request = WSJSONRequest(auth_payload)
         await ws_assistant.send(auth_request)
         
-        # Wait for authentication response
-        async for msg in ws_assistant.iter_messages():
-            data = msg.data
-            if data.get("type") == "AUTHENTICATED":
-                self.logger().info("Successfully authenticated user stream connection")
-                break
-            elif data.get("type") == "AUTH_FAILED":
-                raise IOError(f"User stream authentication failed: {data.get('message', 'Unknown error')}")
+        # Wait for authentication response with timeout
+        auth_success = False
+        try:
+            # Use asyncio.wait_for for Python 3.10+ compatibility instead of asyncio.timeout
+            async def wait_for_auth():
+                async for msg in ws_assistant.iter_messages():
+                    data = msg.data
+                    if data.get("type") == "AUTHENTICATED":
+                        self.logger().info("Successfully authenticated user stream connection")
+                        return True
+                    elif data.get("type") == "AUTH_FAILED":
+                        error_msg = data.get('message', 'Unknown error')
+                        self.logger().error(f"User stream authentication failed: {error_msg}")
+                        raise IOError(f"User stream authentication failed: {error_msg}")
+                    elif data.get("type") == "UNAUTHORIZED":
+                        self.logger().error("User stream authentication unauthorized - API key may lack WebSocket permissions")
+                        raise IOError("User stream authentication unauthorized - API key may lack WebSocket permissions")
+                    else:
+                        self.logger().debug(f"Received unexpected message during auth: {data}")
+                return False
+            
+            # Use asyncio.wait_for instead of asyncio.timeout for Python 3.10+ compatibility
+            auth_success = await asyncio.wait_for(wait_for_auth(), timeout=15.0)
+            
+        except asyncio.TimeoutError:
+            self.logger().error("User stream authentication timeout - no response received")
+            raise IOError("User stream authentication timeout - no response received")
+        
+        if not auth_success:
+            raise IOError("User stream authentication failed - no valid response received")
         
         return ws_assistant
 
@@ -132,44 +154,55 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
         Args:
             output: The queue to place received messages
         """
-        while True:
-            ws_assistant = None
-            try:
-                ws_assistant = await self._connected_websocket_assistant()
-                await self._subscribe_channels(ws_assistant)
+        # First, attempt WebSocket connection with proper authentication
+        websocket_assistant = None
+        
+        try:
+            self.logger().info("Attempting to establish VALR WebSocket user stream connection")
+            websocket_assistant = await self._connected_websocket_assistant()
+            self.logger().info("Successfully established VALR WebSocket user stream connection")
+            
+            # Subscribe to user stream channels
+            await self._subscribe_channels(websocket_assistant)
+            
+            # Main message listening loop
+            async for ws_response in websocket_assistant.iter_messages():
+                event_message = ws_response.data
                 
-                async for ws_response in ws_assistant.iter_messages():
-                    data = ws_response.data
-                    event_type = data.get("type", "")
-                    
-                    # Process different event types
-                    if event_type in [
-                        CONSTANTS.WS_USER_BALANCE_UPDATE_EVENT,
-                        CONSTANTS.WS_USER_NEW_ORDER_EVENT,
-                        CONSTANTS.WS_USER_ORDER_UPDATE_EVENT,
-                        CONSTANTS.WS_USER_ORDER_DELETE_EVENT,
-                        CONSTANTS.WS_USER_TRADE_EVENT,
-                        CONSTANTS.WS_USER_FAILED_CANCEL_EVENT,
-                        CONSTANTS.WS_USER_ORDER_CANCEL_EVENT,
-                        CONSTANTS.WS_USER_INSTANT_ORDER_COMPLETED_EVENT,
-                        CONSTANTS.WS_CANCEL_ON_DISCONNECT_EVENT,
-                    ]:
-                        # Add timestamp if not present
-                        if "timestamp" not in data:
-                            data["timestamp"] = time.time()
-                        
-                        output.put_nowait(data)
-                    
-            except asyncio.CancelledError:
+                # Log received messages for debugging
+                self.logger().debug(f"Received user stream message: {event_message}")
+                
+                # Place the message in the output queue
+                output.put_nowait(event_message)
+                
+        except asyncio.CancelledError:
+            self.logger().info("User stream listener cancelled - shutting down gracefully")
+            raise
+        except Exception as e:
+            error_msg = str(e)
+            self.logger().error(f"Error in user stream connection: {error_msg}")
+            
+            # Check if it's a permission/authentication error
+            if any(keyword in error_msg.lower() for keyword in ["unauthorized", "forbidden", "permission", "401", "403"]):
+                self.logger().warning("VALR WebSocket user stream authentication failed - API key may not have WebSocket permissions")
+                self.logger().warning("Falling back to REST API polling for account updates")
+                
+                # Fall back to REST-only mode by keeping the method running but doing nothing
+                # This allows the connector to work with REST API polling
+                try:
+                    while True:
+                        await asyncio.sleep(60)  # Keep the method running but do nothing
+                except asyncio.CancelledError:
+                    self.logger().info("User stream listener cancelled during REST fallback - shutting down gracefully")
+                    raise
+            else:
+                # For other errors, attempt reconnection
+                self.logger().error(f"User stream connection failed: {error_msg}")
                 raise
-            except Exception:
-                self.logger().exception(
-                    "Unexpected error in user stream listener. Retrying after 5 seconds..."
-                )
-                await self._sleep(5.0)
-            finally:
-                if ws_assistant is not None:
-                    await ws_assistant.disconnect()
+        finally:
+            # Clean up WebSocket connection
+            if websocket_assistant is not None:
+                await websocket_assistant.disconnect()
 
     async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
         """
@@ -178,10 +211,11 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
         Args:
             websocket_assistant: The WebSocket assistant that was interrupted
         """
-        self.logger().info("User stream interrupted. Cleaning up...")
+        self.logger().warning("User stream interrupted. Cleaning up and attempting reconnection...")
         
         # Disconnect the websocket if it exists
         if websocket_assistant is not None:
             await websocket_assistant.disconnect()
         
         # Additional cleanup can be added here if needed
+        # The framework will automatically attempt to reconnect

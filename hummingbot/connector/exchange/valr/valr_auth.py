@@ -78,6 +78,15 @@ class ValrAuth(AuthBase):
         # Extract path and query parameters
         path = request.url.split(CONSTANTS.REST_URL)[-1]
         
+        # Handle query parameters for signature generation
+        # If the request has params, they should be included in the path for signature
+        if hasattr(request, 'params') and request.params:
+            query_string = urlencode(request.params, doseq=True)
+            if '?' in path:
+                path = f"{path}&{query_string}"
+            else:
+                path = f"{path}?{query_string}"
+        
         # Get HTTP verb
         verb = request.method.value
         
