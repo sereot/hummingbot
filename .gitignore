@@ -96,3 +96,9 @@ coverage.xml
 .env
 
 **/.claude/settings.local.json
+
+# API keys and credentials files
+*credentials*.txt
+*api_key*.txt
+*secret*.txt
+test_credentials.txt
