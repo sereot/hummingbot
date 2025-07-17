@@ -52,6 +52,8 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """
         Creates an authenticated connection to the user account WebSocket with rate limiting support.
+        According to VALR WebSocket API documentation, authentication is done via connection headers,
+        and the account WebSocket automatically subscribes to all account events upon connection.
         
         Returns:
             An authenticated WSAssistant instance
@@ -59,43 +61,12 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
         ws_assistant = await self._api_factory.get_ws_assistant()
         
         # Connect to account WebSocket with retry logic for rate limiting
+        # Authentication happens during the WebSocket handshake via headers
         await self._connect_with_retry(ws_assistant, CONSTANTS.WSS_ACCOUNT_URL)
         
-        # Send authentication message after connection
-        auth_payload = self._auth.get_ws_auth_payload("/ws/account")
-        auth_request = WSJSONRequest(auth_payload)
-        await ws_assistant.send(auth_request)
-        
-        # Wait for authentication response with timeout
-        auth_success = False
-        try:
-            # Use asyncio.wait_for for Python 3.10+ compatibility instead of asyncio.timeout
-            async def wait_for_auth():
-                async for msg in ws_assistant.iter_messages():
-                    data = msg.data
-                    if data.get("type") == "AUTHENTICATED":
-                        self.logger().info("Successfully authenticated user stream connection")
-                        return True
-                    elif data.get("type") == "AUTH_FAILED":
-                        error_msg = data.get('message', 'Unknown error')
-                        self.logger().error(f"User stream authentication failed: {error_msg}")
-                        raise IOError(f"User stream authentication failed: {error_msg}")
-                    elif data.get("type") == "UNAUTHORIZED":
-                        self.logger().error("User stream authentication unauthorized - API key may lack WebSocket permissions")
-                        raise IOError("User stream authentication unauthorized - API key may lack WebSocket permissions")
-                    else:
-                        self.logger().debug(f"Received unexpected message during auth: {data}")
-                return False
-            
-            # Use asyncio.wait_for instead of asyncio.timeout for Python 3.10+ compatibility
-            auth_success = await asyncio.wait_for(wait_for_auth(), timeout=15.0)
-            
-        except asyncio.TimeoutError:
-            self.logger().error("User stream authentication timeout - no response received")
-            raise IOError("User stream authentication timeout - no response received")
-        
-        if not auth_success:
-            raise IOError("User stream authentication failed - no valid response received")
+        # VALR account WebSocket automatically subscribes to all account events after successful connection
+        # No authentication payload or explicit subscription messages are needed
+        self.logger().info("Successfully connected to VALR account WebSocket stream")
         
         return ws_assistant
 
@@ -164,12 +135,13 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
     async def listen_for_user_stream(self, output: asyncio.Queue):
         """
         Continuously listens to user stream events and places them in the output queue.
+        Includes ping-pong mechanism to maintain connection as per VALR API requirements.
         
         Args:
             output: The queue to place received messages
         """
-        # First, attempt WebSocket connection with proper authentication
         websocket_assistant = None
+        ping_task = None
         
         try:
             self.logger().info("Attempting to establish VALR WebSocket user stream connection")
@@ -179,9 +151,23 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
             # Subscribe to user stream channels
             await self._subscribe_channels(websocket_assistant)
             
+            # Start ping task for connection keep-alive (VALR requires ping every 30 seconds)
+            ping_task = asyncio.create_task(self._send_ping_messages(websocket_assistant))
+            
             # Main message listening loop
             async for ws_response in websocket_assistant.iter_messages():
                 event_message = ws_response.data
+                
+                # Handle ping/pong messages
+                if isinstance(event_message, str):
+                    if event_message.upper() == "PONG":
+                        self.logger().debug("Received PONG response from VALR")
+                        continue
+                    elif event_message.upper() == "PING":
+                        # Send PONG response
+                        await websocket_assistant.send({"type": "PONG"})
+                        self.logger().debug("Sent PONG response to VALR")
+                        continue
                 
                 # Log received messages for debugging
                 self.logger().debug(f"Received user stream message: {event_message}")
@@ -217,9 +203,38 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 self.logger().error(f"User stream connection failed: {error_msg}")
                 raise
         finally:
+            # Clean up ping task
+            if ping_task and not ping_task.done():
+                ping_task.cancel()
+                try:
+                    await ping_task
+                except asyncio.CancelledError:
+                    pass
+            
             # Clean up WebSocket connection
             if websocket_assistant is not None:
                 await websocket_assistant.disconnect()
+
+    async def _send_ping_messages(self, websocket_assistant):
+        """
+        Sends periodic PING messages to maintain WebSocket connection.
+        VALR requires ping every 30 seconds to keep the connection alive.
+        
+        Args:
+            websocket_assistant: The WebSocket assistant to send pings through
+        """
+        try:
+            while True:
+                await asyncio.sleep(30)  # VALR requires ping every 30 seconds
+                try:
+                    await websocket_assistant.send({"type": "PING"})
+                    self.logger().debug("Sent PING message to VALR account WebSocket")
+                except Exception as e:
+                    self.logger().warning(f"Failed to send PING message: {e}")
+                    break
+        except asyncio.CancelledError:
+            self.logger().debug("Ping task cancelled")
+            raise
 
     async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
         """

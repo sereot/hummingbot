@@ -117,6 +117,8 @@ class ValrAuth(AuthBase):
     async def ws_authenticate(self, request: WSRequest) -> WSRequest:
         """
         Adds authentication headers to WebSocket connection requests.
+        According to VALR WebSocket API documentation, authentication is done
+        via connection headers with proper HMAC-SHA512 signature.
         
         Args:
             request: The WebSocket request to authenticate
@@ -128,43 +130,41 @@ class ValrAuth(AuthBase):
         if request.headers is not None:
             headers.update(request.headers)
         
-        # WebSocket authentication uses the same headers as REST
+        # Generate timestamp for authentication
         timestamp = int(time.time() * 1000)
         
-        # For WebSocket, we authenticate the connection itself
-        # VALR WebSocket auth is done through the connection URL with API key
-        # or through initial message after connection
+        # Extract WebSocket path from URL for signature generation
+        ws_path = request.url.split('api.valr.com')[-1] if 'api.valr.com' in request.url else '/ws/account'
+        
+        # Generate signature using WebSocket path
+        # VALR requires signing: timestamp + 'GET' + ws_path + ''
+        verb = "GET"
+        body = ""
+        signature = self._generate_signature(timestamp, verb, ws_path, body)
+        
+        # Add authentication headers as per VALR WebSocket documentation
         headers["X-VALR-API-KEY"] = self._api_key
+        headers["X-VALR-SIGNATURE"] = signature
+        headers["X-VALR-TIMESTAMP"] = str(timestamp)
         
         request.headers = headers
         return request
 
-    def get_ws_auth_payload(self, ws_path: str = "/ws/account") -> Dict[str, Any]:
+    def get_ws_auth_payload(self, ws_path: str = "/ws/account") -> Optional[Dict[str, Any]]:
         """
-        Gets the authentication payload for WebSocket initial message.
-        VALR requires sending API credentials with proper HMAC signature after connection.
+        VALR WebSocket authentication is done via connection headers, not payload messages.
+        Based on the official VALR API documentation, authentication happens during the 
+        WebSocket handshake using X-VALR-API-KEY, X-VALR-SIGNATURE, and X-VALR-TIMESTAMP headers.
         
         Args:
             ws_path: The WebSocket path being authenticated (/ws/account or /ws/trade)
             
         Returns:
-            Dictionary with authentication data including signature
+            None - VALR doesn't use authentication payload messages
         """
-        timestamp = int(time.time() * 1000)
-        
-        # For WebSocket authentication, VALR requires signing the WebSocket connection path
-        # The signature is generated similar to REST API calls
-        verb = "GET"
-        body = ""
-        
-        signature = self._generate_signature(timestamp, verb, ws_path, body)
-        
-        return {
-            "type": "AUTHENTICATE", 
-            "apiKey": self._api_key,
-            "timestamp": timestamp,
-            "signature": signature
-        }
+        # VALR doesn't require authentication payload after connection
+        # Authentication is handled via WebSocket connection headers
+        return None
 
     def generate_auth_dict(
         self,

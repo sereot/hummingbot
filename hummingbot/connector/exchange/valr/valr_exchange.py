@@ -101,7 +101,16 @@ class ValrExchange(ExchangePyBase):
     @property
     def is_trading_required(self) -> bool:
         return self._trading_required
-    
+
+    def trading_pair_symbol_map_ready(self) -> bool:
+        """
+        Checks if the mapping from exchange symbols to client trading pairs has been initialized.
+        This is required for the connector to reach ready state.
+        
+        Returns:
+            True if the symbol mapping has been initialized, False otherwise
+        """
+        return self._trading_pair_symbol_map is not None and len(self._trading_pair_symbol_map) > 0
 
 
 
@@ -227,11 +236,19 @@ class ValrExchange(ExchangePyBase):
                     try:
                         trading_pair = web_utils.convert_from_exchange_trading_pair(exchange_symbol)
                         mapping[exchange_symbol] = trading_pair
+                        self.logger().debug(f"Added symbol mapping: {exchange_symbol} -> {trading_pair}")
                     except Exception:
                         self.logger().exception(f"Error processing trading pair {exchange_symbol}")
         
         self.logger().info(f"Setting symbol mapping with {len(mapping)} pairs")
         self._set_trading_pair_symbol_map(mapping)
+        
+        # Verify the mapping was set correctly
+        if hasattr(self, '_trading_pair_symbol_map') and self._trading_pair_symbol_map:
+            self.logger().info(f"Symbol mapping initialized successfully with {len(self._trading_pair_symbol_map)} pairs")
+            self.logger().debug(f"Symbol mapping ready status: {self.trading_pair_symbol_map_ready()}")
+        else:
+            self.logger().warning("Symbol mapping initialization failed - mapping is empty or None")
 
     def _get_fee(
         self,

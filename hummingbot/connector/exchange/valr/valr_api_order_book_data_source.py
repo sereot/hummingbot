@@ -235,44 +235,58 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _subscribe_channels(self, ws: WSAssistant):
         """
-        Subscribes to the trade events and diff orders events through the provided websocket connection.
-        Required by the base class.
+        Subscribes to the trade events and order book events through the Trade WebSocket connection.
+        Based on VALR API documentation, the Trade WebSocket requires explicit subscription to events.
         
         Args:
             ws: The websocket assistant used to connect to the exchange
         """
         try:
-            for trading_pair in self._trading_pairs:
-                exchange_pair = web_utils.convert_to_exchange_trading_pair(trading_pair)
-                
-                # Subscribe to aggregated orderbook updates
-                orderbook_subscribe_request = WSJSONRequest({
-                    "type": CONSTANTS.WS_SUBSCRIBE_EVENT,
-                    "subscriptions": [{
-                        "event": "AGGREGATED_ORDERBOOK_UPDATE",
-                        "pairs": [exchange_pair]
-                    }]
-                })
-                
-                # Subscribe to trade updates
-                trade_subscribe_request = WSJSONRequest({
-                    "type": CONSTANTS.WS_SUBSCRIBE_EVENT,
-                    "subscriptions": [{
-                        "event": "NEW_TRADE",
-                        "pairs": [exchange_pair]
-                    }]
-                })
-                
-                await ws.send(orderbook_subscribe_request)
-                await ws.send(trade_subscribe_request)
-                
-            self.logger().info("Subscribed to public order book and trade channels...")
+            # Collect all trading pairs for batch subscription
+            exchange_pairs = [web_utils.convert_to_exchange_trading_pair(pair) for pair in self._trading_pairs]
+            
+            # Subscribe to aggregated orderbook updates for all pairs at once
+            # This provides top 40 bids/asks updates
+            orderbook_subscribe_request = WSJSONRequest({
+                "type": "SUBSCRIBE",
+                "subscriptions": [{
+                    "event": "AGGREGATED_ORDERBOOK_UPDATE",
+                    "pairs": exchange_pairs
+                }]
+            })
+            
+            # Subscribe to trade updates for all pairs at once
+            trade_subscribe_request = WSJSONRequest({
+                "type": "SUBSCRIBE",
+                "subscriptions": [{
+                    "event": "NEW_TRADE",
+                    "pairs": exchange_pairs
+                }]
+            })
+            
+            # Subscribe to market summary updates to get trading pair information
+            # This helps with symbols mapping initialization
+            market_summary_subscribe_request = WSJSONRequest({
+                "type": "SUBSCRIBE",
+                "subscriptions": [{
+                    "event": "MARKET_SUMMARY_UPDATE",
+                    "pairs": exchange_pairs
+                }]
+            })
+            
+            # Send all subscription requests
+            await ws.send(orderbook_subscribe_request)
+            await ws.send(trade_subscribe_request) 
+            await ws.send(market_summary_subscribe_request)
+            
+            self.logger().info(f"Subscribed to Trade WebSocket channels for {len(exchange_pairs)} pairs: "
+                             f"AGGREGATED_ORDERBOOK_UPDATE, NEW_TRADE, MARKET_SUMMARY_UPDATE")
             
         except asyncio.CancelledError:
             raise
         except Exception:
             self.logger().error(
-                "Unexpected error occurred subscribing to order book trading and delta streams...",
+                "Unexpected error occurred subscribing to Trade WebSocket streams...",
                 exc_info=True
             )
             raise
@@ -291,12 +305,17 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
         channel = ""
         event_type = event_message.get("type", "")
         
-        if event_type == CONSTANTS.WS_MARKET_TRADE_EVENT:
+        if event_type == "NEW_TRADE":
             channel = self._trade_messages_queue_key
-        elif event_type == CONSTANTS.WS_MARKET_AGGREGATED_ORDERBOOK_UPDATE_EVENT:
+        elif event_type == "AGGREGATED_ORDERBOOK_UPDATE":
             channel = self._diff_messages_queue_key
-        elif event_type == CONSTANTS.WS_MARKET_FULL_ORDERBOOK_SNAPSHOT_EVENT:
+        elif event_type == "FULL_ORDERBOOK_SNAPSHOT":
             channel = self._snapshot_messages_queue_key
+        elif event_type == "FULL_ORDERBOOK_UPDATE":
+            channel = self._snapshot_messages_queue_key
+        elif event_type == "MARKET_SUMMARY_UPDATE":
+            # Handle market summary updates to help with symbol mapping
+            channel = "market_summary"
             
         return channel
 
@@ -310,14 +329,18 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
             message_queue: Queue where the parsed messages should be stored in
         """
         try:
-            pair = raw_message.get("currencyPair", "")
+            # VALR NEW_TRADE format: {"type": "NEW_TRADE", "currencyPairSymbol": "BTCZAR", "data": {...}}
+            pair = raw_message.get("currencyPairSymbol", "")
             trading_pair = web_utils.convert_from_exchange_trading_pair(pair)
             
             if trading_pair not in self._trading_pairs:
                 return
             
+            # Extract the data payload
+            data = raw_message.get("data", {})
+            
             # Determine trade type
-            side = raw_message.get("takerSide", "").upper()
+            side = data.get("takerSide", "").upper()
             trade_type = TradeType.BUY if side == "BUY" else TradeType.SELL
             
             # Create trade message
@@ -326,10 +349,10 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 content={
                     "trading_pair": trading_pair,
                     "trade_type": float(trade_type.value),
-                    "trade_id": raw_message.get("id", ""),
-                    "price": raw_message.get("price", "0"),
-                    "amount": raw_message.get("quantity", "0"),
-                    "timestamp": raw_message.get("tradedAt", time.time()),
+                    "trade_id": data.get("id", ""),
+                    "price": data.get("price", "0"),
+                    "amount": data.get("quantity", "0"),
+                    "timestamp": data.get("tradedAt", time.time()),
                 },
                 timestamp=time.time(),
             )
@@ -349,17 +372,22 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
             message_queue: Queue where the parsed messages should be stored in
         """
         try:
+            # VALR AGGREGATED_ORDERBOOK_UPDATE format: {"type": "AGGREGATED_ORDERBOOK_UPDATE", "currencyPairSymbol": "BTCZAR", "data": {...}}
             pair = raw_message.get("currencyPairSymbol", "")
             trading_pair = web_utils.convert_from_exchange_trading_pair(pair)
             
             if trading_pair not in self._trading_pairs:
                 return
-                
-            # Extract bids and asks
-            raw_bids = raw_message.get("Bids", [])
-            raw_asks = raw_message.get("Asks", [])
+            
+            # Extract the data payload
+            data = raw_message.get("data", {})
+            
+            # Extract bids and asks from the data payload
+            raw_bids = data.get("Bids", [])
+            raw_asks = data.get("Asks", [])
             
             # Transform VALR API response format to Hummingbot expected format
+            # VALR format: [{"side": "sell", "quantity": "0.005", "price": "9500", "currencyPair": "BTCZAR", "orderCount": 1}, ...]
             def transform_orders(orders):
                 """Transform VALR order format to Hummingbot format"""
                 return [[order["price"], order["quantity"]] for order in orders]
@@ -395,17 +423,22 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
             message_queue: Queue where the parsed messages should be stored in
         """
         try:
+            # VALR FULL_ORDERBOOK_SNAPSHOT format: {"type": "FULL_ORDERBOOK_SNAPSHOT", "currencyPairSymbol": "BTCUSDC", "data": {...}}
             pair = raw_message.get("currencyPairSymbol", "")
             trading_pair = web_utils.convert_from_exchange_trading_pair(pair)
             
             if trading_pair not in self._trading_pairs:
                 return
-                
-            # Extract bids and asks
-            raw_bids = raw_message.get("Bids", [])
-            raw_asks = raw_message.get("Asks", [])
+            
+            # Extract the data payload
+            data = raw_message.get("data", {})
+            
+            # Extract bids and asks from the data payload
+            raw_bids = data.get("Bids", [])
+            raw_asks = data.get("Asks", [])
             
             # Transform VALR API response format to Hummingbot expected format
+            # VALR format: [{"side": "sell", "quantity": "0.005", "price": "9500", "currencyPair": "BTCZAR", "orderCount": 1}, ...]
             def transform_orders(orders):
                 """Transform VALR order format to Hummingbot format"""
                 return [[order["price"], order["quantity"]] for order in orders]
@@ -430,3 +463,122 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
             
         except Exception:
             self.logger().exception("Error processing order book snapshot message")
+
+    async def _handle_market_summary_update(self, raw_message: Dict[str, Any]):
+        """
+        Handle MARKET_SUMMARY_UPDATE messages to help with symbol mapping initialization.
+        This helps the connector understand available trading pairs and reach ready state.
+        
+        Args:
+            raw_message: The JSON dictionary of the market summary update event
+        """
+        try:
+            # VALR MARKET_SUMMARY_UPDATE format: {"type": "MARKET_SUMMARY_UPDATE", "currencyPairSymbol": "BTCZAR", "data": {...}}
+            pair = raw_message.get("currencyPairSymbol", "")
+            
+            if pair and self._connector:
+                # Convert to hummingbot format
+                try:
+                    trading_pair = web_utils.convert_from_exchange_trading_pair(pair)
+                    
+                    # Update the connector's symbol mapping if not already done
+                    if hasattr(self._connector, '_trading_pair_symbol_map') and self._connector._trading_pair_symbol_map is not None:
+                        if pair not in self._connector._trading_pair_symbol_map:
+                            self._connector._trading_pair_symbol_map[pair] = trading_pair
+                            self.logger().debug(f"Added symbol mapping: {pair} -> {trading_pair}")
+                    
+                except Exception as e:
+                    self.logger().debug(f"Could not process symbol mapping for {pair}: {e}")
+                        
+        except Exception:
+            self.logger().exception("Error processing market summary update message")
+
+    async def listen_for_order_book_stream(self, output: asyncio.Queue):
+        """
+        Override to handle VALR-specific message routing including market summary updates.
+        Includes ping-pong mechanism to maintain Trade WebSocket connection.
+        
+        Args:
+            output: The queue to send parsed messages to
+        """
+        ping_task = None
+        
+        # Message processor with ping/pong handling
+        async def message_processor():
+            async for raw_message in self._ws_assistant.iter_messages():
+                try:
+                    message_data = raw_message.data
+                    
+                    # Handle ping/pong messages for Trade WebSocket
+                    if isinstance(message_data, str):
+                        if message_data.upper() == "PONG":
+                            self.logger().debug("Received PONG response from VALR Trade WebSocket")
+                            continue
+                        elif message_data.upper() == "PING":
+                            # Send PONG response
+                            await self._ws_assistant.send({"type": "PONG"})
+                            self.logger().debug("Sent PONG response to VALR Trade WebSocket")
+                            continue
+                    
+                    message_type = message_data.get("type", "")
+                    
+                    # Handle market summary updates separately for symbol mapping
+                    if message_type == "MARKET_SUMMARY_UPDATE":
+                        await self._handle_market_summary_update(message_data)
+                        continue
+                    
+                    # Process other message types using parent's logic
+                    channel = self._channel_originating_message(message_data)
+                    if channel:
+                        if channel == self._trade_messages_queue_key:
+                            await self._parse_trade_message(message_data, output)
+                        elif channel == self._diff_messages_queue_key:
+                            await self._parse_order_book_diff_message(message_data, output)
+                        elif channel in [self._snapshot_messages_queue_key]:
+                            await self._parse_order_book_snapshot_message(message_data, output)
+                            
+                except Exception:
+                    self.logger().exception("Error processing order book stream message")
+        
+        try:
+            if not self._ws_assistant:
+                self._ws_assistant = await self._connected_websocket_assistant()
+                await self._subscribe_channels(self._ws_assistant)
+            
+            # Start ping task for connection keep-alive (VALR requires ping every 30 seconds)
+            ping_task = asyncio.create_task(self._send_ping_messages())
+            
+            await message_processor()
+            
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().exception("Error in order book stream listener")
+            raise
+        finally:
+            # Clean up ping task
+            if ping_task and not ping_task.done():
+                ping_task.cancel()
+                try:
+                    await ping_task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _send_ping_messages(self):
+        """
+        Sends periodic PING messages to maintain Trade WebSocket connection.
+        VALR requires ping every 30 seconds to keep the connection alive.
+        """
+        try:
+            while True:
+                await asyncio.sleep(30)  # VALR requires ping every 30 seconds
+                try:
+                    if self._ws_assistant:
+                        await self._ws_assistant.send({"type": "PING"})
+                        self.logger().debug("Sent PING message to VALR Trade WebSocket")
+                except Exception as e:
+                    self.logger().warning(f"Failed to send PING message to Trade WebSocket: {e}")
+                    break
+        except asyncio.CancelledError:
+            self.logger().debug("Trade WebSocket ping task cancelled")
+            raise
