@@ -40,12 +40,12 @@ class ValrTestBot(ScriptStrategyBase):
     Key Features:
     - Uses DOGE-USDT pair (DOGEUSDT active and available on VALR)
     - 100 bps spread to prevent accidental fills
-    - Minimal order amounts (4 DOGE minimum)
+    - Order amounts of 4 DOGE (VALR minimum requirement)
     - Post-only orders (LIMIT_MAKER) for safety
     - 30-second refresh interval
     - Comprehensive logging for testing verification
     
-    DOGEUSDT Trading Specifications:
+    DOGEUSDT Trading Specifications (from VALR API):
     - Min Base Amount: 4 DOGE
     - Max Base Amount: 680,000 DOGE
     - Min Quote Amount: 0.5 USDT

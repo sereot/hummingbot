@@ -81,34 +81,35 @@ ORDER_STATE = {
     "Rejected": OrderState.FAILED,
 }
 
-# Rate Limits
+# Rate Limits - Conservative values to prevent HTTP 429 errors
+# Based on observed 429 rate limit errors, using very conservative limits
 NO_LIMIT = 1000000  # Used for endpoints without explicit limits
 RATE_LIMITS = [
-    # Public endpoints
-    RateLimit(limit_id=TICKER_PRICE_PATH_URL, limit=10, time_interval=1),
-    RateLimit(limit_id=EXCHANGE_INFO_PATH_URL, limit=10, time_interval=1),
-    RateLimit(limit_id=SNAPSHOT_PATH_URL, limit=30, time_interval=1),
-    RateLimit(limit_id=SERVER_TIME_PATH_URL, limit=10, time_interval=1),
-    RateLimit(limit_id=PING_PATH_URL, limit=10, time_interval=1),
-    RateLimit(limit_id=PAIRS_PATH_URL, limit=10, time_interval=1),
-    # Private endpoints
-    RateLimit(limit_id=ACCOUNTS_PATH_URL, limit=30, time_interval=1),
-    RateLimit(limit_id=MY_TRADES_PATH_URL, limit=30, time_interval=1),
-    RateLimit(limit_id=ORDER_PATH_URL, limit=60, time_interval=1),
-    RateLimit(limit_id=PLACE_ORDER_PATH_URL, limit=100, time_interval=1),
-    RateLimit(limit_id=CANCEL_ORDER_PATH_URL, limit=100, time_interval=1),
-    RateLimit(limit_id=CANCEL_ALL_ORDERS_PATH_URL, limit=10, time_interval=1),
-    RateLimit(limit_id=ORDER_STATUS_PATH_URL, limit=60, time_interval=1),
-    RateLimit(limit_id=USER_STREAM_PATH_URL, limit=10, time_interval=1),
-    RateLimit(limit_id=SET_LEVERAGE_PATH_URL, limit=10, time_interval=1),
-    RateLimit(limit_id=GET_INCOME_HISTORY_PATH_URL, limit=30, time_interval=1),
-    RateLimit(limit_id=POSITION_INFORMATION_PATH_URL, limit=30, time_interval=1),
-    RateLimit(limit_id=ACCOUNT_INFO_PATH_URL, limit=10, time_interval=1),
-    RateLimit(limit_id=ORDER_MODIFY_PATH_URL, limit=60, time_interval=1),
-    RateLimit(limit_id=ORDER_HISTORY_PATH_URL, limit=30, time_interval=1),
-    # WebSocket connections
-    RateLimit(limit_id=WSS_ACCOUNT_URL, limit=5, time_interval=60),
-    RateLimit(limit_id=WSS_TRADE_URL, limit=5, time_interval=60),
+    # Public endpoints - Very conservative to prevent 429 errors during initialization
+    RateLimit(limit_id=TICKER_PRICE_PATH_URL, limit=2, time_interval=1),
+    RateLimit(limit_id=EXCHANGE_INFO_PATH_URL, limit=1, time_interval=2),  # Critical for initialization
+    RateLimit(limit_id=SNAPSHOT_PATH_URL, limit=5, time_interval=1),
+    RateLimit(limit_id=SERVER_TIME_PATH_URL, limit=1, time_interval=3),   # Critical for time sync
+    RateLimit(limit_id=PING_PATH_URL, limit=1, time_interval=2),
+    RateLimit(limit_id=PAIRS_PATH_URL, limit=1, time_interval=5),         # Critical for symbol mapping
+    # Private endpoints - Reduced limits to prevent 429 errors  
+    RateLimit(limit_id=ACCOUNTS_PATH_URL, limit=5, time_interval=1),
+    RateLimit(limit_id=MY_TRADES_PATH_URL, limit=5, time_interval=1),
+    RateLimit(limit_id=ORDER_PATH_URL, limit=10, time_interval=1),
+    RateLimit(limit_id=PLACE_ORDER_PATH_URL, limit=20, time_interval=1),
+    RateLimit(limit_id=CANCEL_ORDER_PATH_URL, limit=20, time_interval=1),
+    RateLimit(limit_id=CANCEL_ALL_ORDERS_PATH_URL, limit=2, time_interval=1),
+    RateLimit(limit_id=ORDER_STATUS_PATH_URL, limit=10, time_interval=1),
+    RateLimit(limit_id=USER_STREAM_PATH_URL, limit=1, time_interval=5),
+    RateLimit(limit_id=SET_LEVERAGE_PATH_URL, limit=1, time_interval=2),
+    RateLimit(limit_id=GET_INCOME_HISTORY_PATH_URL, limit=5, time_interval=1),
+    RateLimit(limit_id=POSITION_INFORMATION_PATH_URL, limit=5, time_interval=1),
+    RateLimit(limit_id=ACCOUNT_INFO_PATH_URL, limit=2, time_interval=1),
+    RateLimit(limit_id=ORDER_MODIFY_PATH_URL, limit=10, time_interval=1),
+    RateLimit(limit_id=ORDER_HISTORY_PATH_URL, limit=5, time_interval=1),
+    # WebSocket connections - Much more conservative to prevent 429 handshake errors
+    RateLimit(limit_id=WSS_ACCOUNT_URL, limit=1, time_interval=120),      # Very conservative
+    RateLimit(limit_id=WSS_TRADE_URL, limit=1, time_interval=120),        # Very conservative
 ]
 
 # WebSocket connection limits

@@ -34,6 +34,20 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._connector = connector
         self._api_factory = api_factory
         self._domain = domain
+        self._last_recv_time: float = 0  # Track last received time for REST fallback mode
+    
+    @property
+    def last_recv_time(self) -> float:
+        """
+        Returns the time of the last received message.
+        In REST fallback mode, this is updated manually.
+        
+        :return: the timestamp of the last received message in seconds
+        """
+        # Use our own timestamp in REST fallback mode, otherwise use WebSocket assistant
+        if self._ws_assistant:
+            return max(self._last_recv_time, self._ws_assistant.last_recv_time)
+        return self._last_recv_time
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """
@@ -187,11 +201,14 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 self.logger().warning("VALR WebSocket user stream authentication failed - API key may not have WebSocket permissions")
                 self.logger().warning("Falling back to REST API polling for account updates")
                 
-                # Fall back to REST-only mode by keeping the method running but doing nothing
-                # This allows the connector to work with REST API polling
+                # Fall back to REST-only mode by keeping the method running 
+                # Update last_recv_time periodically to indicate user stream is "active"
+                # This allows the connector to become ready even in REST-only mode
                 try:
                     while True:
-                        await asyncio.sleep(60)  # Keep the method running but do nothing
+                        # Update last_recv_time to simulate active user stream
+                        self._last_recv_time = time.time()
+                        await asyncio.sleep(30)  # Update every 30 seconds
                 except asyncio.CancelledError:
                     self.logger().info("User stream listener cancelled during REST fallback - shutting down gracefully")
                     raise

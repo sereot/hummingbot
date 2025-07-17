@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -150,21 +151,63 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """
-        Creates a websocket assistant connected to the exchange's WebSocket endpoint.
+        Creates a websocket assistant connected to the exchange's WebSocket endpoint with retry logic.
         Required by the base class.
         
         Returns:
             A websocket assistant instance connected to the exchange
         """
-        ws_assistant = await self._api_factory.get_ws_assistant()
+        max_retries = 5
+        base_delay = 2.0
         
-        # Connect to the WebSocket endpoint
-        await ws_assistant.connect(
-            ws_url=CONSTANTS.WSS_TRADE_URL,
-            ping_timeout=CONSTANTS.PING_TIMEOUT
-        )
+        for attempt in range(max_retries):
+            try:
+                self.logger().debug(f"Attempting WebSocket connection (attempt {attempt + 1}/{max_retries})")
+                
+                ws_assistant = await self._api_factory.get_ws_assistant()
+                
+                # Connect to the WebSocket endpoint
+                await ws_assistant.connect(
+                    ws_url=CONSTANTS.WSS_TRADE_URL,
+                    ping_timeout=CONSTANTS.PING_TIMEOUT
+                )
+                
+                self.logger().info(f"Successfully connected to WebSocket on attempt {attempt + 1}")
+                return ws_assistant
+                
+            except Exception as e:
+                error_message = str(e).lower()
+                
+                # Check if this is a 429 rate limit error
+                if "429" in error_message or "rate limit" in error_message:
+                    if attempt < max_retries - 1:
+                        # Calculate exponential backoff delay
+                        delay = base_delay * (2 ** attempt)
+                        self.logger().warning(f"WebSocket connection rate limited (attempt {attempt + 1}/{max_retries}). "
+                                           f"Retrying in {delay:.1f} seconds: {e}")
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        self.logger().error(f"Max retries reached for WebSocket connection. "
+                                          f"Will operate in REST-only mode: {e}")
+                        # Don't raise exception - allow connector to work in REST-only mode
+                        raise Exception(f"WebSocket connection failed after {max_retries} attempts due to rate limiting")
+                else:
+                    # For non-429 errors, retry with shorter delay
+                    if attempt < max_retries - 1:
+                        delay = 1.0
+                        self.logger().warning(f"WebSocket connection error (attempt {attempt + 1}/{max_retries}). "
+                                           f"Retrying in {delay:.1f} seconds: {e}")
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        self.logger().error(f"Failed to establish WebSocket connection after {max_retries} attempts. "
+                                          f"Operating in REST-only mode: {e}")
+                        # Don't raise exception - allow connector to work in REST-only mode
+                        raise Exception(f"WebSocket connection failed after {max_retries} attempts: {error_message}")
         
-        return ws_assistant
+        # This should never be reached, but just in case
+        raise Exception(f"Unexpected exit from WebSocket connection retry loop")
 
     async def _get_ws_assistant(self) -> WSAssistant:
         """

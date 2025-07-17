@@ -1,4 +1,6 @@
 import time
+import asyncio
+import logging
 from typing import Any, Dict, Optional, Callable
 from urllib.parse import urlencode
 
@@ -84,10 +86,13 @@ def build_api_factory(
         A WebAssistantsFactory instance
     """
     time_synchronizer = time_synchronizer or TimeSynchronizer()
-    time_provider = time_provider or (lambda: get_current_server_time(
-        throttler=throttler,
-        domain=domain,
-    ))
+    async def _time_provider():
+        return await get_current_server_time(
+            throttler=throttler,
+            domain=domain,
+        )
+    
+    time_provider = time_provider or _time_provider
     
     # Create rest pre-processor that adds required headers
     rest_pre_processors = [
@@ -135,7 +140,7 @@ async def get_current_server_time(
     domain: str = CONSTANTS.DEFAULT_DOMAIN,
 ) -> float:
     """
-    Gets the current server time from VALR.
+    Gets the current server time from VALR with retry logic for 429 rate limit errors.
     
     Args:
         throttler: The async throttler to use for rate limiting
@@ -144,27 +149,75 @@ async def get_current_server_time(
     Returns:
         Current server time as a float timestamp
     """
+    logger = logging.getLogger(__name__)
+    max_retries = 5
+    base_delay = 1.0
+    
     api_factory = build_api_factory_without_time_synchronizer_pre_processor(
         throttler=throttler,
         domain=domain,
     )
     rest_assistant = await api_factory.get_rest_assistant()
     
-    response = await rest_assistant.execute_request(
-        url=public_rest_url(path_url=CONSTANTS.SERVER_TIME_PATH_URL, domain=domain),
-        method=RESTMethod.GET,
-        throttler_limit_id=CONSTANTS.SERVER_TIME_PATH_URL,
-    )
+    for attempt in range(max_retries):
+        try:
+            logger.debug(f"Attempting to get server time (attempt {attempt + 1}/{max_retries})")
+            
+            response = await rest_assistant.execute_request(
+                url=public_rest_url(path_url=CONSTANTS.SERVER_TIME_PATH_URL, domain=domain),
+                method=RESTMethod.GET,
+                throttler_limit_id=CONSTANTS.SERVER_TIME_PATH_URL,
+            )
+            
+            # VALR returns time in milliseconds
+            if not isinstance(response, dict):
+                raise ValueError(f"Expected dict response for server time, got {type(response)}: {response}")
+            
+            server_time_ms = response.get("epochTime")
+            if server_time_ms is None:
+                raise ValueError(f"Missing epochTime in server response: {response}")
+            
+            logger.debug(f"Successfully retrieved server time: {server_time_ms / 1000.0}")
+            return server_time_ms / 1000.0  # Convert to seconds
+            
+        except Exception as e:
+            error_message = str(e).lower()
+            
+            # Check if this is a 429 rate limit error
+            if "429" in error_message or "rate limit" in error_message:
+                if attempt < max_retries - 1:
+                    # Calculate exponential backoff delay
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"Rate limit error getting server time (attempt {attempt + 1}/{max_retries}). "
+                                 f"Retrying in {delay:.1f} seconds: {e}")
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"Max retries reached for server time. Falling back to local time: {e}")
+                    # Fallback to local time if all retries fail
+                    fallback_time = time.time()
+                    logger.warning(f"Using local time as fallback: {fallback_time}")
+                    return fallback_time
+            else:
+                # For non-429 errors, retry with shorter delay
+                if attempt < max_retries - 1:
+                    delay = 0.5
+                    logger.warning(f"Error getting server time (attempt {attempt + 1}/{max_retries}). "
+                                 f"Retrying in {delay:.1f} seconds: {e}")
+                    await asyncio.sleep(delay)
+                    continue
+                else:
+                    logger.error(f"Failed to get server time after {max_retries} attempts. "
+                               f"Falling back to local time: {e}")
+                    # Fallback to local time if all retries fail
+                    fallback_time = time.time()
+                    logger.warning(f"Using local time as fallback: {fallback_time}")
+                    return fallback_time
     
-    # VALR returns time in milliseconds
-    if not isinstance(response, dict):
-        raise ValueError(f"Expected dict response for server time, got {type(response)}: {response}")
-    
-    server_time_ms = response.get("epochTime")
-    if server_time_ms is None:
-        raise ValueError(f"Missing epochTime in server response: {response}")
-    
-    return server_time_ms / 1000.0  # Convert to seconds
+    # This should never be reached, but just in case
+    fallback_time = time.time()
+    logger.error(f"Unexpected exit from retry loop. Using local time fallback: {fallback_time}")
+    return fallback_time
 
 
 def get_new_client_order_id(

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -129,6 +130,58 @@ class ValrExchange(ExchangePyBase):
                 and cancelation_exception.response.status == 404)
         )
 
+    async def _make_trading_pairs_request(self) -> Any:
+        """
+        Override to add retry logic for 429 rate limit errors on trading pairs API.
+        
+        Returns:
+            Exchange info with trading pairs data
+        """
+        max_retries = 5
+        base_delay = 2.0
+        
+        for attempt in range(max_retries):
+            try:
+                self.logger().debug(f"Requesting trading pairs (attempt {attempt + 1}/{max_retries})")
+                
+                # Use the base implementation to make the API call
+                exchange_info = await self._api_get(path_url=self.trading_pairs_request_path)
+                
+                self.logger().info(f"Successfully retrieved trading pairs on attempt {attempt + 1}")
+                return exchange_info
+                
+            except Exception as e:
+                error_message = str(e).lower()
+                
+                # Check if this is a 429 rate limit error
+                if "429" in error_message or "rate limit" in error_message:
+                    if attempt < max_retries - 1:
+                        # Calculate exponential backoff delay
+                        delay = base_delay * (2 ** attempt)
+                        self.logger().warning(f"Trading pairs request rate limited (attempt {attempt + 1}/{max_retries}). "
+                                           f"Retrying in {delay:.1f} seconds: {e}")
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        self.logger().error(f"Max retries reached for trading pairs request: {e}")
+                        # Re-raise the exception to let base class handle it
+                        raise
+                else:
+                    # For non-429 errors, retry with shorter delay
+                    if attempt < max_retries - 1:
+                        delay = 1.0
+                        self.logger().warning(f"Trading pairs request error (attempt {attempt + 1}/{max_retries}). "
+                                           f"Retrying in {delay:.1f} seconds: {e}")
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        self.logger().error(f"Failed to get trading pairs after {max_retries} attempts: {e}")
+                        # Re-raise the exception to let base class handle it
+                        raise
+        
+        # This should never be reached, but just in case
+        raise Exception("Unexpected exit from trading pairs request retry loop")
+
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         return web_utils.build_api_factory(
             throttler=self._throttler,
@@ -163,8 +216,11 @@ class ValrExchange(ExchangePyBase):
         Initialize trading pair symbols from exchange info.
         VALR provides pairs info in a list format.
         """
+        self.logger().info(f"_initialize_trading_pair_symbols_from_exchange_info called with type: {type(exchange_info)}")
+        
         mapping = {}
         if isinstance(exchange_info, list):
+            self.logger().info(f"Processing {len(exchange_info)} pairs for symbol mapping")
             for pair_info in exchange_info:
                 if self._is_pair_valid_for_trading(pair_info):
                     exchange_symbol = pair_info.get("symbol", "")
@@ -174,6 +230,7 @@ class ValrExchange(ExchangePyBase):
                     except Exception:
                         self.logger().exception(f"Error processing trading pair {exchange_symbol}")
         
+        self.logger().info(f"Setting symbol mapping with {len(mapping)} pairs")
         self._set_trading_pair_symbol_map(mapping)
 
     def _get_fee(
@@ -287,6 +344,11 @@ class ValrExchange(ExchangePyBase):
                 raise
 
     async def _format_trading_rules(self, exchange_info_list: List[Dict[str, Any]]) -> List[TradingRule]:
+        self.logger().info(f"_format_trading_rules called with {len(exchange_info_list) if exchange_info_list else 0} items")
+        
+        # Initialize symbol mapping from exchange info before processing trading rules
+        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info_list)
+        
         trading_rules = []
         
         for pair_info in exchange_info_list:
