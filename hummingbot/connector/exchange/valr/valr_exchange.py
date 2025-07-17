@@ -1,8 +1,9 @@
 import asyncio
 import json
 import logging
+import uuid
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any
 
 from hummingbot.connector.exchange.valr import valr_constants as CONSTANTS, valr_web_utils as web_utils
 from hummingbot.connector.exchange.valr.valr_api_order_book_data_source import ValrAPIOrderBookDataSource
@@ -20,7 +21,7 @@ from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTr
 from hummingbot.core.data_type.trade_fee import TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.utils.estimate_fee import build_trade_fee
-from hummingbot.core.web_assistant.connections.data_types import RESTMethod
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod, WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 if TYPE_CHECKING:
@@ -37,7 +38,7 @@ class ValrExchange(ExchangePyBase):
         client_config_map: "ClientConfigAdapter",
         valr_api_key: str,
         valr_api_secret: str,
-        trading_pairs: Optional[List[str]] = None,
+        trading_pairs: list[str] | None = None,
         trading_required: bool = True,
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
     ):
@@ -46,6 +47,13 @@ class ValrExchange(ExchangePyBase):
         self._domain = domain
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
+        
+        # Initialize trading pair symbol mapping
+        self._trading_pair_symbol_map: dict[str, str] | None = None
+        
+        # WebSocket order placement tracking
+        self._ws_order_requests: dict[str, asyncio.Future] = {}  # clientMsgId -> Future
+        self._ws_order_placement_enabled = False
         
         super().__init__(client_config_map)
         
@@ -63,7 +71,7 @@ class ValrExchange(ExchangePyBase):
         return "valr"
 
     @property
-    def rate_limits_rules(self) -> List[RateLimit]:
+    def rate_limits_rules(self) -> list[RateLimit]:
         return CONSTANTS.RATE_LIMITS
 
     @property
@@ -91,7 +99,7 @@ class ValrExchange(ExchangePyBase):
         return CONSTANTS.PING_PATH_URL
 
     @property
-    def trading_pairs(self) -> List[str]:
+    def trading_pairs(self) -> list[str]:
         return self._trading_pairs
 
     @property
@@ -112,9 +120,19 @@ class ValrExchange(ExchangePyBase):
         """
         return self._trading_pair_symbol_map is not None and len(self._trading_pair_symbol_map) > 0
 
+    def _set_trading_pair_symbol_map(self, mapping: dict[str, str]):
+        """
+        Sets the trading pair symbol mapping dictionary.
+        
+        Args:
+            mapping: Dictionary mapping exchange symbols to Hummingbot trading pairs
+        """
+        self._trading_pair_symbol_map = mapping.copy() if mapping else None
+        self.logger().debug(f"Symbol mapping set with {len(mapping) if mapping else 0} pairs")
 
 
-    def supported_order_types(self) -> List[OrderType]:
+
+    def supported_order_types(self) -> list[OrderType]:
         return [OrderType.LIMIT, OrderType.LIMIT_MAKER]
 
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception) -> bool:
@@ -220,7 +238,7 @@ class ValrExchange(ExchangePyBase):
         self.logger().info("User stream data source created (will use REST-only mode)")
         return user_stream
 
-    def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
+    def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: dict[str, Any]):
         """
         Initialize trading pair symbols from exchange info.
         VALR provides pairs info in a list format.
@@ -247,8 +265,15 @@ class ValrExchange(ExchangePyBase):
         if hasattr(self, '_trading_pair_symbol_map') and self._trading_pair_symbol_map:
             self.logger().info(f"Symbol mapping initialized successfully with {len(self._trading_pair_symbol_map)} pairs")
             self.logger().debug(f"Symbol mapping ready status: {self.trading_pair_symbol_map_ready()}")
+            
+            # Log some examples for debugging
+            sample_pairs = list(self._trading_pair_symbol_map.items())[:5]
+            self.logger().debug(f"Sample mappings: {sample_pairs}")
         else:
-            self.logger().warning("Symbol mapping initialization failed - mapping is empty or None")
+            self.logger().error("Symbol mapping initialization failed - mapping is empty or None")
+            self.logger().error(f"Original mapping had {len(mapping)} pairs")
+            self.logger().error(f"Mapping attribute exists: {hasattr(self, '_trading_pair_symbol_map')}")
+            self.logger().error(f"Mapping value: {getattr(self, '_trading_pair_symbol_map', 'NOT_SET')}")
 
     def _get_fee(
         self,
@@ -258,7 +283,7 @@ class ValrExchange(ExchangePyBase):
         order_side: TradeType,
         amount: Decimal,
         price: Decimal = Decimal("NaN"),
-        is_maker: Optional[bool] = None
+        is_maker: bool | None = None
     ) -> TradeFeeBase:
         is_maker = is_maker or (order_type is OrderType.LIMIT_MAKER)
         fee = build_trade_fee(
@@ -282,9 +307,31 @@ class ValrExchange(ExchangePyBase):
         order_type: OrderType,
         price: Decimal,
         **kwargs
-    ) -> Tuple[str, float]:
+    ) -> tuple[str, float]:
         
-        exchange_order_id = ""
+        # Try WebSocket order placement first if enabled
+        if self._ws_order_placement_enabled:
+            try:
+                exchange_order_id, timestamp = await self._place_order_websocket(
+                    order_id, trading_pair, amount, trade_type, order_type, price
+                )
+                return exchange_order_id, timestamp
+            except Exception as e:
+                self.logger().warning(f"WebSocket order placement failed, falling back to REST: {e}")
+                
+        # Fallback to REST API order placement
+        return await self._place_order_rest(order_id, trading_pair, amount, trade_type, order_type, price)
+    
+    async def _place_order_rest(
+        self,
+        order_id: str,
+        trading_pair: str,
+        amount: Decimal,
+        trade_type: TradeType,
+        order_type: OrderType,
+        price: Decimal,
+    ) -> tuple[str, float]:
+        """Place order via REST API (original implementation)"""
         
         rest_assistant = await self._web_assistants_factory.get_rest_assistant()
         
@@ -310,10 +357,76 @@ class ValrExchange(ExchangePyBase):
         exchange_order_id = str(order_result["id"])
         
         return exchange_order_id, self.current_timestamp
+    
+    async def _place_order_websocket(
+        self,
+        order_id: str,
+        trading_pair: str,
+        amount: Decimal,
+        trade_type: TradeType,
+        order_type: OrderType,
+        price: Decimal,
+    ) -> tuple[str, float]:
+        """Place order via WebSocket"""
+        
+        # Generate unique client message ID for correlation
+        client_msg_id = str(uuid.uuid4())
+        
+        # Get WebSocket assistant from user stream data source
+        if not hasattr(self, '_user_stream_tracker') or not self._user_stream_tracker:
+            raise Exception("User stream tracker not available for WebSocket order placement")
+        
+        user_stream_data_source = self._user_stream_tracker.data_source
+        if not hasattr(user_stream_data_source, '_ws_assistant') or not user_stream_data_source._ws_assistant:
+            raise Exception("WebSocket assistant not available for order placement")
+        
+        ws_assistant = user_stream_data_source._ws_assistant
+        
+        # Prepare WebSocket order message
+        order_message = WSJSONRequest({
+            "type": CONSTANTS.WS_PLACE_LIMIT_ORDER_EVENT if order_type == OrderType.LIMIT else CONSTANTS.WS_PLACE_MARKET_ORDER_EVENT,
+            "clientMsgId": client_msg_id,
+            "data": {
+                "pair": web_utils.convert_to_exchange_trading_pair(trading_pair),
+                "side": "BUY" if trade_type == TradeType.BUY else "SELL",
+                "quantity": str(amount),
+                "price": str(price),
+                "postOnly": order_type == OrderType.LIMIT_MAKER,
+                "customerOrderId": order_id,
+            }
+        })
+        
+        # Create future for response tracking
+        response_future = asyncio.Future()
+        self._ws_order_requests[client_msg_id] = response_future
+        
+        try:
+            # Send order message
+            await ws_assistant.send(order_message)
+            self.logger().debug(f"Sent WebSocket order placement: {client_msg_id}")
+            
+            # Wait for response with timeout
+            response = await asyncio.wait_for(response_future, timeout=30.0)
+            
+            # Extract order ID from response
+            if response.get("type") == CONSTANTS.WS_ORDER_RESPONSE_EVENT:
+                exchange_order_id = str(response["data"]["orderId"])
+                return exchange_order_id, self.current_timestamp
+            else:
+                raise Exception(f"Order placement failed: {response}")
+                
+        except asyncio.TimeoutError:
+            raise Exception("WebSocket order placement timed out")
+        except Exception as e:
+            raise Exception(f"WebSocket order placement error: {e}")
+        finally:
+            # Clean up future
+            if client_msg_id in self._ws_order_requests:
+                del self._ws_order_requests[client_msg_id]
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         """
-        Cancel an order using the proper VALR API endpoint.
+        Cancel an order using WebSocket if available, otherwise fallback to REST API.
         
         Args:
             order_id: The client order ID to cancel
@@ -322,6 +435,18 @@ class ValrExchange(ExchangePyBase):
         Returns:
             The API response from the cancellation request
         """
+        # Try WebSocket cancellation first if enabled
+        if self._ws_order_placement_enabled:
+            try:
+                return await self._cancel_order_websocket(order_id, tracked_order)
+            except Exception as e:
+                self.logger().warning(f"WebSocket order cancellation failed, falling back to REST: {e}")
+        
+        # Fallback to REST API cancellation
+        return await self._cancel_order_rest(order_id, tracked_order)
+    
+    async def _cancel_order_rest(self, order_id: str, tracked_order: InFlightOrder):
+        """Cancel order via REST API (original implementation)."""
         rest_assistant = await self._web_assistants_factory.get_rest_assistant()
         
         # Convert trading pair to VALR format (e.g., "DOGE-USDT" -> "DOGEUSDT")
@@ -334,7 +459,7 @@ class ValrExchange(ExchangePyBase):
             "pair": valr_pair
         }
         
-        self.logger().debug(f"Cancelling order - ID: {order_id}, pair: {valr_pair}")
+        self.logger().debug(f"Cancelling order via REST - ID: {order_id}, pair: {valr_pair}")
         
         try:
             cancel_result = await rest_assistant.execute_request(
@@ -345,7 +470,7 @@ class ValrExchange(ExchangePyBase):
                 is_auth_required=True,
             )
             
-            self.logger().info(f"Successfully cancelled order {order_id}")
+            self.logger().info(f"Successfully cancelled order {order_id} via REST")
             return cancel_result
             
         except Exception as e:
@@ -359,8 +484,64 @@ class ValrExchange(ExchangePyBase):
             else:
                 self.logger().error(f"Failed to cancel order {order_id}: {error_msg}")
                 raise
+    
+    async def _cancel_order_websocket(self, order_id: str, tracked_order: InFlightOrder):
+        """Cancel order via WebSocket."""
+        # Generate unique client message ID for correlation
+        client_msg_id = str(uuid.uuid4())
+        
+        # Get WebSocket assistant from user stream data source
+        if not hasattr(self, '_user_stream_tracker') or not self._user_stream_tracker:
+            raise Exception("User stream tracker not available for WebSocket order cancellation")
+        
+        user_stream_data_source = self._user_stream_tracker.data_source
+        if not hasattr(user_stream_data_source, '_ws_assistant') or not user_stream_data_source._ws_assistant:
+            raise Exception("WebSocket assistant not available for order cancellation")
+        
+        ws_assistant = user_stream_data_source._ws_assistant
+        
+        # Convert trading pair to VALR format
+        valr_pair = web_utils.convert_to_exchange_trading_pair(tracked_order.trading_pair)
+        
+        # Prepare WebSocket cancel message
+        cancel_message = WSJSONRequest({
+            "type": CONSTANTS.WS_PLACE_CANCEL_ORDER_EVENT,
+            "clientMsgId": client_msg_id,
+            "data": {
+                "customerOrderId": order_id,
+                "pair": valr_pair
+            }
+        })
+        
+        # Create future for response tracking
+        response_future = asyncio.Future()
+        self._ws_order_requests[client_msg_id] = response_future
+        
+        try:
+            # Send cancel message
+            await ws_assistant.send(cancel_message)
+            self.logger().debug(f"Sent WebSocket order cancellation: {client_msg_id}")
+            
+            # Wait for response with timeout
+            response = await asyncio.wait_for(response_future, timeout=30.0)
+            
+            # Check if cancellation was successful
+            if response.get("type") == CONSTANTS.WS_USER_ORDER_CANCEL_EVENT:
+                self.logger().info(f"Successfully cancelled order {order_id} via WebSocket")
+                return response
+            else:
+                raise Exception(f"Order cancellation failed: {response}")
+                
+        except asyncio.TimeoutError:
+            raise Exception("WebSocket order cancellation timed out")
+        except Exception as e:
+            raise Exception(f"WebSocket order cancellation error: {e}")
+        finally:
+            # Clean up future
+            if client_msg_id in self._ws_order_requests:
+                del self._ws_order_requests[client_msg_id]
 
-    async def _format_trading_rules(self, exchange_info_list: List[Dict[str, Any]]) -> List[TradingRule]:
+    async def _format_trading_rules(self, exchange_info_list: list[dict[str, Any]]) -> list[TradingRule]:
         self.logger().info(f"_format_trading_rules called with {len(exchange_info_list) if exchange_info_list else 0} items")
         
         # Initialize symbol mapping from exchange info before processing trading rules
@@ -396,7 +577,7 @@ class ValrExchange(ExchangePyBase):
                 
         return trading_rules
 
-    def _is_pair_valid_for_trading(self, pair_info: Dict[str, Any]) -> bool:
+    def _is_pair_valid_for_trading(self, pair_info: dict[str, Any]) -> bool:
         """Check if a trading pair is valid for spot trading."""
         # Check if pair is active
         if not pair_info.get("active", False):
@@ -435,7 +616,7 @@ class ValrExchange(ExchangePyBase):
                     CONSTANTS.WS_USER_ORDER_CANCEL_EVENT,
                     CONSTANTS.WS_USER_INSTANT_ORDER_COMPLETED_EVENT,
                 ]:
-                    await self._process_order_update(event_message)
+                    await self._process_order_lifecycle_event(event_message)
                     
                 elif event_type == CONSTANTS.WS_USER_TRADE_EVENT:
                     await self._process_trade_update(event_message)
@@ -443,12 +624,15 @@ class ValrExchange(ExchangePyBase):
                 elif event_type == CONSTANTS.WS_USER_FAILED_CANCEL_EVENT:
                     self.logger().warning(f"Failed to cancel order: {event_message}")
                     
+                elif event_type in [CONSTANTS.WS_ORDER_RESPONSE_EVENT, CONSTANTS.WS_ORDER_FAILED_EVENT]:
+                    await self._process_websocket_order_response(event_message)
+                    
             except asyncio.CancelledError:
                 raise
             except Exception:
                 self.logger().exception("Unexpected error in user stream listener")
 
-    async def _process_balance_update(self, event_message: Dict[str, Any]):
+    async def _process_balance_update(self, event_message: dict[str, Any]):
         """Process balance update events."""
         try:
             balances = event_message.get("data", {})
@@ -498,34 +682,71 @@ class ValrExchange(ExchangePyBase):
         except Exception:
             self.logger().exception("Error processing balance update")
 
-    async def _process_order_update(self, event_message: Dict[str, Any]):
-        """Process order update events."""
+    async def _process_order_lifecycle_event(self, event_message: dict[str, Any]):
+        """Process comprehensive order lifecycle events."""
         try:
+            event_type = event_message.get("type", "")
             order_data = event_message.get("data", {})
-            client_order_id = order_data.get("customerOrderId", "")
             
+            # Extract order identifiers
+            client_order_id = order_data.get("customerOrderId", "")
+            exchange_order_id = str(order_data.get("orderId", ""))
+            
+            # Find tracked order
             tracked_order = self._order_tracker.all_orders.get(client_order_id)
             if not tracked_order:
+                # For new orders, we might not have the tracked order yet
+                if event_type == CONSTANTS.WS_USER_NEW_ORDER_EVENT:
+                    self.logger().debug(f"Received new order event for unknown order: {client_order_id}")
                 return
                 
-            # Map VALR order status to Hummingbot order state
-            valr_status = order_data.get("orderStatusType", "")
-            order_state = CONSTANTS.ORDER_STATE.get(valr_status, OrderState.OPEN)
+            # Determine order state based on event type and status
+            order_state = self._get_order_state_from_event(event_type, order_data)
             
+            # Create order update
             order_update = OrderUpdate(
                 trading_pair=tracked_order.trading_pair,
                 update_timestamp=event_message.get("timestamp", self.current_timestamp),
                 new_state=order_state,
                 client_order_id=client_order_id,
-                exchange_order_id=str(order_data.get("orderId", "")),
+                exchange_order_id=exchange_order_id or tracked_order.exchange_order_id,
             )
             
+            # Process the update
             self._order_tracker.process_order_update(order_update)
             
+            # Log significant order lifecycle events
+            if event_type == CONSTANTS.WS_USER_NEW_ORDER_EVENT:
+                self.logger().info(f"Order placed successfully: {client_order_id}")
+            elif event_type == CONSTANTS.WS_USER_ORDER_CANCEL_EVENT:
+                self.logger().info(f"Order cancelled: {client_order_id}")
+            elif event_type == CONSTANTS.WS_USER_INSTANT_ORDER_COMPLETED_EVENT:
+                self.logger().info(f"Order completed: {client_order_id}")
+            
         except Exception:
-            self.logger().exception("Error processing order update")
+            self.logger().exception("Error processing order lifecycle event")
+    
+    def _get_order_state_from_event(self, event_type: str, order_data: dict[str, Any]) -> OrderState:
+        """Determine order state from event type and data."""
+        
+        # Handle specific event types
+        if event_type == CONSTANTS.WS_USER_NEW_ORDER_EVENT:
+            return OrderState.OPEN
+        elif event_type == CONSTANTS.WS_USER_ORDER_CANCEL_EVENT:
+            return OrderState.CANCELED
+        elif event_type == CONSTANTS.WS_USER_ORDER_DELETE_EVENT:
+            return OrderState.CANCELED
+        elif event_type == CONSTANTS.WS_USER_INSTANT_ORDER_COMPLETED_EVENT:
+            return OrderState.FILLED
+        elif event_type == CONSTANTS.WS_USER_ORDER_UPDATE_EVENT:
+            # Use status from order data for updates
+            valr_status = order_data.get("orderStatusType", "")
+            return CONSTANTS.ORDER_STATE.get(valr_status, OrderState.OPEN)
+        
+        # Default fallback
+        return OrderState.OPEN
 
-    async def _process_trade_update(self, event_message: Dict[str, Any]):
+    async def _process_trade_update(self, event_message: dict[str, Any]):
         """Process trade execution events."""
         try:
             trade_data = event_message.get("data", {})
@@ -564,8 +785,57 @@ class ValrExchange(ExchangePyBase):
             
         except Exception:
             self.logger().exception("Error processing trade update")
+    
+    async def _process_websocket_order_response(self, event_message: dict[str, Any]):
+        """Process WebSocket order placement response messages."""
+        try:
+            client_msg_id = event_message.get("clientMsgId", "")
+            
+            if client_msg_id and client_msg_id in self._ws_order_requests:
+                # Complete the future with the response
+                future = self._ws_order_requests[client_msg_id]
+                if not future.done():
+                    future.set_result(event_message)
+                    self.logger().debug(f"WebSocket order response processed: {client_msg_id}")
+            else:
+                self.logger().debug(f"Received WebSocket order response for unknown clientMsgId: {client_msg_id}")
+                
+        except Exception:
+            self.logger().exception("Error processing WebSocket order response")
+    
+    def enable_websocket_order_placement(self):
+        """Enable WebSocket order placement (for testing or when WebSocket is stable)."""
+        self._ws_order_placement_enabled = True
+        self.logger().info("WebSocket order placement enabled")
+    
+    def disable_websocket_order_placement(self):
+        """Disable WebSocket order placement (fallback to REST)."""
+        self._ws_order_placement_enabled = False
+        self.logger().info("WebSocket order placement disabled")
+    
+    async def enable_cancel_on_disconnect(self):
+        """Enable cancel-on-disconnect feature."""
+        if hasattr(self, '_user_stream_tracker') and self._user_stream_tracker:
+            user_stream_data_source = self._user_stream_tracker.data_source
+            if hasattr(user_stream_data_source, '_ws_assistant') and user_stream_data_source._ws_assistant:
+                await user_stream_data_source._enable_cancel_on_disconnect(user_stream_data_source._ws_assistant)
+            else:
+                self.logger().warning("WebSocket assistant not available for cancel-on-disconnect")
+        else:
+            self.logger().warning("User stream tracker not available for cancel-on-disconnect")
+    
+    async def disable_cancel_on_disconnect(self):
+        """Disable cancel-on-disconnect feature."""
+        if hasattr(self, '_user_stream_tracker') and self._user_stream_tracker:
+            user_stream_data_source = self._user_stream_tracker.data_source
+            if hasattr(user_stream_data_source, '_ws_assistant') and user_stream_data_source._ws_assistant:
+                await user_stream_data_source._disable_cancel_on_disconnect(user_stream_data_source._ws_assistant)
+            else:
+                self.logger().warning("WebSocket assistant not available for cancel-on-disconnect")
+        else:
+            self.logger().warning("User stream tracker not available for cancel-on-disconnect")
 
-    def _get_fee_from_trade(self, trade_data: Dict[str, Any]) -> TradeFeeBase:
+    def _get_fee_from_trade(self, trade_data: dict[str, Any]) -> TradeFeeBase:
         """Extract fee information from trade data."""
         # VALR includes fee in the trade data
         fee_amount = Decimal(str(trade_data.get("fee", "0")))
@@ -761,7 +1031,7 @@ class ValrExchange(ExchangePyBase):
                 exchange_order_id=order.exchange_order_id,
             )
 
-    async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
+    async def _all_trade_updates_for_order(self, order: InFlightOrder) -> list[TradeUpdate]:
         """
         Request all trade updates for a specific order.
         """

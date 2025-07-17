@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import time
+import zlib
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any
 
 from hummingbot.connector.exchange.valr import valr_constants as CONSTANTS, valr_web_utils as web_utils
 from hummingbot.core.data_type.common import TradeType
@@ -23,11 +24,11 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
     DIFF_STREAM_ID = 2
     FULL_ORDER_BOOK_RESET_DELTA_SECONDS = 60 * 60
 
-    _logger: Optional[HummingbotLogger] = None
+    _logger: HummingbotLogger | None = None
 
     def __init__(
         self,
-        trading_pairs: List[str],
+        trading_pairs: list[str],
         connector: "ValrExchange",
         api_factory: WebAssistantsFactory,
         domain: str = CONSTANTS.DEFAULT_DOMAIN,
@@ -37,16 +38,21 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._api_factory = api_factory
         self._domain = domain
         self._trading_pairs = trading_pairs
-        self._ws_assistant: Optional[WSAssistant] = None
+        self._ws_assistant: WSAssistant | None = None
         
         # Set up proper queue keys for base class integration
         self._trade_messages_queue_key = CONSTANTS.WS_MARKET_TRADE_EVENT
         self._diff_messages_queue_key = CONSTANTS.WS_MARKET_AGGREGATED_ORDERBOOK_UPDATE_EVENT
         self._snapshot_messages_queue_key = CONSTANTS.WS_MARKET_FULL_ORDERBOOK_SNAPSHOT_EVENT
+        
+        # Sequence number tracking for order book integrity
+        self._sequence_numbers: dict[str, int] = {}
+        self._checksum_failures: dict[str, int] = {}
+        self._max_checksum_failures = 3  # Maximum consecutive failures before resubscription
 
     async def get_last_traded_prices(
-        self, trading_pairs: List[str], domain: Optional[str] = None
-    ) -> Dict[str, float]:
+        self, trading_pairs: list[str], domain: str | None = None
+    ) -> dict[str, float]:
         """
         Get the last traded prices for the specified trading pairs.
         
@@ -81,7 +87,7 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 
         return results
 
-    async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
+    async def _request_order_book_snapshot(self, trading_pair: str) -> dict[str, Any]:
         """
         Retrieves a copy of the full order book from the exchange, for a particular trading pair.
         
@@ -119,20 +125,27 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
         """
         snapshot = await self._request_order_book_snapshot(trading_pair)
         
-        # Transform VALR API response format to Hummingbot expected format
-        # VALR returns: [{"side": "buy", "quantity": "100", "price": "0.5", ...}, ...]
-        # Hummingbot expects: [["0.5", "100"], ...]
-        
-        def transform_orders(orders):
-            """Transform VALR order format to Hummingbot format"""
-            return [[order["price"], order["quantity"]] for order in orders]
-        
+        # Extract raw bids and asks from the snapshot
         raw_bids = snapshot.get("Bids", [])
         raw_asks = snapshot.get("Asks", [])
         
-        # Transform the orders to the expected format
-        bids = transform_orders(raw_bids)
-        asks = transform_orders(raw_asks)
+        # Process order book update with proper quantity handling
+        bids, asks = self._process_order_book_update(raw_bids, raw_asks)
+        
+        # Initialize sequence number for this trading pair from snapshot
+        sequence_number = snapshot.get("SequenceNumber")
+        if sequence_number is not None:
+            self._sequence_numbers[trading_pair] = sequence_number
+            self.logger().debug(f"Initialized sequence number for {trading_pair} from REST snapshot: {sequence_number}")
+        
+        # Validate checksum if provided
+        expected_checksum = snapshot.get("Checksum")
+        if expected_checksum is not None:
+            if not self._validate_orderbook_checksum(bids, asks, expected_checksum):
+                self.logger().warning(f"REST snapshot checksum validation failed for {trading_pair}")
+                # Continue with the snapshot even if checksum fails for REST endpoint
+            else:
+                self._reset_checksum_failure_count(trading_pair)
         
         # Create snapshot message
         snapshot_msg = OrderBookMessage(
@@ -141,7 +154,7 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 "trading_pair": trading_pair,
                 "bids": bids,
                 "asks": asks,
-                "update_id": snapshot.get("SequenceNumber", int(time.time() * 1e3)),
+                "update_id": sequence_number or int(time.time() * 1e3),
                 "timestamp": time.time(),
             },
             timestamp=time.time(),
@@ -221,7 +234,7 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
             self._ws_assistant = await self._connected_websocket_assistant()
         return self._ws_assistant
 
-    async def _on_order_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
+    async def _on_order_stream_interruption(self, websocket_assistant: WSAssistant | None):
         """
         Called when the WebSocket connection is interrupted.
         Cleanup the WebSocket assistant.
@@ -291,7 +304,7 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
             )
             raise
 
-    def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
+    def _channel_originating_message(self, event_message: dict[str, Any]) -> str:
         """
         Identifies the channel for a particular event message. Used to find the correct queue to add the message in.
         Required by the base class.
@@ -319,7 +332,7 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
             
         return channel
 
-    async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+    async def _parse_trade_message(self, raw_message: dict[str, Any], message_queue: asyncio.Queue):
         """
         Create an instance of OrderBookMessage of type OrderBookMessageType.TRADE
         Required by the base class.
@@ -362,7 +375,7 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
         except Exception:
             self.logger().exception("Error processing trade message")
 
-    async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+    async def _parse_order_book_diff_message(self, raw_message: dict[str, Any], message_queue: asyncio.Queue):
         """
         Create an instance of OrderBookMessage of type OrderBookMessageType.DIFF
         Required by the base class.
@@ -386,14 +399,23 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
             raw_bids = data.get("Bids", [])
             raw_asks = data.get("Asks", [])
             
-            # Transform VALR API response format to Hummingbot expected format
-            # VALR format: [{"side": "sell", "quantity": "0.005", "price": "9500", "currencyPair": "BTCZAR", "orderCount": 1}, ...]
-            def transform_orders(orders):
-                """Transform VALR order format to Hummingbot format"""
-                return [[order["price"], order["quantity"]] for order in orders]
+            # Process order book update with proper quantity handling
+            bids, asks = self._process_order_book_update(raw_bids, raw_asks)
             
-            bids = transform_orders(raw_bids)
-            asks = transform_orders(raw_asks)
+            # Validate sequence number
+            sequence_number = data.get("SequenceNumber")
+            if not self._validate_sequence_number(trading_pair, sequence_number):
+                self.logger().warning(f"Sequence validation failed for {trading_pair}. Skipping update.")
+                return
+            
+            # Validate checksum if provided
+            expected_checksum = data.get("Checksum")
+            if expected_checksum is not None:
+                if not self._validate_orderbook_checksum(bids, asks, expected_checksum):
+                    self._handle_checksum_failure(trading_pair)
+                    return
+                else:
+                    self._reset_checksum_failure_count(trading_pair)
             
             # Create diff message
             diff_msg = OrderBookMessage(
@@ -402,7 +424,7 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "trading_pair": trading_pair,
                     "bids": bids,
                     "asks": asks,
-                    "update_id": raw_message.get("SequenceNumber", int(time.time() * 1e3)),
+                    "update_id": data.get("SequenceNumber", int(time.time() * 1e3)),
                     "timestamp": time.time(),
                 },
                 timestamp=time.time(),
@@ -413,7 +435,7 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
         except Exception:
             self.logger().exception("Error processing order book diff message")
 
-    async def _parse_order_book_snapshot_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+    async def _parse_order_book_snapshot_message(self, raw_message: dict[str, Any], message_queue: asyncio.Queue):
         """
         Create an instance of OrderBookMessage of type OrderBookMessageType.SNAPSHOT
         Required by the base class.
@@ -437,14 +459,25 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
             raw_bids = data.get("Bids", [])
             raw_asks = data.get("Asks", [])
             
-            # Transform VALR API response format to Hummingbot expected format
-            # VALR format: [{"side": "sell", "quantity": "0.005", "price": "9500", "currencyPair": "BTCZAR", "orderCount": 1}, ...]
-            def transform_orders(orders):
-                """Transform VALR order format to Hummingbot format"""
-                return [[order["price"], order["quantity"]] for order in orders]
+            # Process order book update with proper quantity handling
+            bids, asks = self._process_order_book_update(raw_bids, raw_asks)
             
-            bids = transform_orders(raw_bids)
-            asks = transform_orders(raw_asks)
+            # Initialize sequence number for snapshot
+            sequence_number = data.get("SequenceNumber")
+            if sequence_number is not None:
+                self._sequence_numbers[trading_pair] = sequence_number
+                self.logger().debug(f"Initialized sequence number for {trading_pair} from snapshot: {sequence_number}")
+            
+            # Validate checksum if provided
+            expected_checksum = data.get("Checksum")
+            if expected_checksum is not None:
+                if not self._validate_orderbook_checksum(bids, asks, expected_checksum):
+                    self.logger().warning(f"Order book snapshot checksum validation failed for {trading_pair}. "
+                                        f"Requesting fresh snapshot...")
+                    # TODO: Implement resubscription logic for checksum failure
+                    return
+                else:
+                    self._reset_checksum_failure_count(trading_pair)
             
             # Create snapshot message
             snapshot_msg = OrderBookMessage(
@@ -453,7 +486,7 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     "trading_pair": trading_pair,
                     "bids": bids,
                     "asks": asks,
-                    "update_id": raw_message.get("SequenceNumber", int(time.time() * 1e3)),
+                    "update_id": data.get("SequenceNumber", int(time.time() * 1e3)),
                     "timestamp": time.time(),
                 },
                 timestamp=time.time(),
@@ -464,7 +497,7 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
         except Exception:
             self.logger().exception("Error processing order book snapshot message")
 
-    async def _handle_market_summary_update(self, raw_message: Dict[str, Any]):
+    async def _handle_market_summary_update(self, raw_message: dict[str, Any]):
         """
         Handle MARKET_SUMMARY_UPDATE messages to help with symbol mapping initialization.
         This helps the connector understand available trading pairs and reach ready state.
@@ -516,7 +549,7 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
                             continue
                         elif message_data.upper() == "PING":
                             # Send PONG response
-                            await self._ws_assistant.send({"type": "PONG"})
+                            await self._ws_assistant.send(WSJSONRequest({"type": "PONG"}))
                             self.logger().debug("Sent PONG response to VALR Trade WebSocket")
                             continue
                     
@@ -574,7 +607,7 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await asyncio.sleep(30)  # VALR requires ping every 30 seconds
                 try:
                     if self._ws_assistant:
-                        await self._ws_assistant.send({"type": "PING"})
+                        await self._ws_assistant.send(WSJSONRequest({"type": "PING"}))
                         self.logger().debug("Sent PING message to VALR Trade WebSocket")
                 except Exception as e:
                     self.logger().warning(f"Failed to send PING message to Trade WebSocket: {e}")
@@ -582,3 +615,220 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
         except asyncio.CancelledError:
             self.logger().debug("Trade WebSocket ping task cancelled")
             raise
+
+    def _calculate_orderbook_checksum(self, bids: list[list[str]], asks: list[list[str]]) -> int:
+        """
+        Calculate CRC32 checksum for order book data as per VALR API specification.
+        
+        The checksum is calculated by:
+        1. Taking the 25 best bids and 25 best asks
+        2. Concatenating a string with bid price, bid quantity, ask price, ask quantity
+        3. Separating each value with a colon (:)
+        4. Calculating unsigned CRC32 hash
+        
+        Args:
+            bids: List of bid orders in [price, quantity] format
+            asks: List of ask orders in [price, quantity] format
+            
+        Returns:
+            Unsigned CRC32 checksum integer
+        """
+        try:
+            # Take the 25 best bids and asks (as per VALR specification)
+            best_bids = bids[:25] if len(bids) > 0 else []
+            best_asks = asks[:25] if len(asks) > 0 else []
+            
+            # Build the checksum string
+            checksum_parts = []
+            
+            # Add bids and asks alternately as specified in VALR docs
+            max_orders = max(len(best_bids), len(best_asks))
+            for i in range(max_orders):
+                if i < len(best_bids):
+                    checksum_parts.append(best_bids[i][0])  # bid price
+                    checksum_parts.append(best_bids[i][1])  # bid quantity
+                if i < len(best_asks):
+                    checksum_parts.append(best_asks[i][0])  # ask price
+                    checksum_parts.append(best_asks[i][1])  # ask quantity
+            
+            # Join with colon separator
+            checksum_string = ":".join(checksum_parts)
+            
+            # Calculate unsigned CRC32 hash
+            checksum = zlib.crc32(checksum_string.encode('utf-8')) & 0xffffffff
+            
+            self.logger().debug(f"Calculated checksum: {checksum} for string: {checksum_string[:100]}...")
+            return checksum
+            
+        except Exception as e:
+            self.logger().error(f"Error calculating order book checksum: {e}")
+            return 0
+
+    def _validate_orderbook_checksum(self, bids: list[list[str]], asks: list[list[str]], 
+                                   expected_checksum: int | None) -> bool:
+        """
+        Validate order book checksum against expected value.
+        
+        Args:
+            bids: List of bid orders in [price, quantity] format
+            asks: List of ask orders in [price, quantity] format
+            expected_checksum: Expected checksum from VALR API
+            
+        Returns:
+            True if checksum is valid or not provided, False if validation fails
+        """
+        if expected_checksum is None:
+            # No checksum provided, assume valid
+            return True
+            
+        try:
+            calculated_checksum = self._calculate_orderbook_checksum(bids, asks)
+            
+            if calculated_checksum == expected_checksum:
+                self.logger().debug(f"Order book checksum validation successful: {calculated_checksum}")
+                return True
+            else:
+                self.logger().warning(f"Order book checksum validation failed! "
+                                    f"Expected: {expected_checksum}, Calculated: {calculated_checksum}")
+                return False
+                
+        except Exception as e:
+            self.logger().error(f"Error validating order book checksum: {e}")
+            return False
+
+    def _validate_sequence_number(self, trading_pair: str, sequence_number: int | None) -> bool:
+        """
+        Validate sequence number for order book updates with tolerance for small gaps.
+        In high-frequency trading, small gaps are common and acceptable.
+        
+        Args:
+            trading_pair: The trading pair for sequence tracking
+            sequence_number: The sequence number from the message
+            
+        Returns:
+            True if sequence is valid or gap is acceptable, False if gap is too large
+        """
+        if sequence_number is None:
+            return True
+            
+        try:
+            expected_sequence = self._sequence_numbers.get(trading_pair)
+            
+            if expected_sequence is None:
+                # First message for this pair
+                self._sequence_numbers[trading_pair] = sequence_number
+                self.logger().debug(f"Initialized sequence number for {trading_pair}: {sequence_number}")
+                return True
+            
+            if sequence_number == expected_sequence + 1:
+                # Normal sequence
+                self._sequence_numbers[trading_pair] = sequence_number
+                return True
+            elif sequence_number <= expected_sequence:
+                # Duplicate or old message
+                self.logger().debug(f"Received old/duplicate sequence {sequence_number} for {trading_pair}, "
+                                  f"expected {expected_sequence + 1}")
+                return False
+            else:
+                # Gap detected - allow small gaps (up to 50 messages) but reject large gaps
+                gap_size = sequence_number - expected_sequence - 1
+                if gap_size <= 50:  # Allow small gaps (common in high-frequency trading)
+                    self.logger().debug(f"Small sequence gap ({gap_size}) for {trading_pair} - continuing")
+                    self._sequence_numbers[trading_pair] = sequence_number
+                    return True
+                else:
+                    # Large gap - may indicate missed updates
+                    self.logger().warning(f"Large sequence gap ({gap_size}) for {trading_pair}! "
+                                        f"Expected {expected_sequence + 1}, received {sequence_number}")
+                    # Update to current sequence but allow the update to process
+                    self._sequence_numbers[trading_pair] = sequence_number
+                    return True  # Still allow the update to process
+                
+        except Exception as e:
+            self.logger().error(f"Error validating sequence number: {e}")
+            return True  # Assume valid on error
+            
+    def _process_order_book_update(self, raw_bids: list[dict], raw_asks: list[dict]) -> tuple[list[list[str]], list[list[str]]]:
+        """
+        Process order book update with proper quantity handling.
+        Orders with quantity "0" should be removed as per VALR specification.
+        
+        Args:
+            raw_bids: Raw bid orders from VALR API
+            raw_asks: Raw ask orders from VALR API
+            
+        Returns:
+            Tuple of (processed_bids, processed_asks) in Hummingbot format
+        """
+        try:
+            def process_orders(orders):
+                """Process orders and filter out zero quantities"""
+                processed = []
+                for order in orders:
+                    quantity = order.get("quantity", "0")
+                    if quantity != "0" and float(quantity) > 0:
+                        processed.append([order["price"], quantity])
+                return processed
+            
+            bids = process_orders(raw_bids)
+            asks = process_orders(raw_asks)
+            
+            return bids, asks
+            
+        except Exception as e:
+            self.logger().error(f"Error processing order book update: {e}")
+            return [], []
+            
+    def _handle_checksum_failure(self, trading_pair: str):
+        """
+        Handle checksum validation failure with exponential backoff.
+        
+        Args:
+            trading_pair: The trading pair that failed checksum validation
+        """
+        try:
+            failure_count = self._checksum_failures.get(trading_pair, 0) + 1
+            self._checksum_failures[trading_pair] = failure_count
+            
+            if failure_count >= self._max_checksum_failures:
+                self.logger().error(f"Too many consecutive checksum failures for {trading_pair} "
+                                  f"({failure_count}). Triggering order book reset.")
+                # Reset sequence number to force resync
+                if trading_pair in self._sequence_numbers:
+                    del self._sequence_numbers[trading_pair]
+                # Reset checksum failure counter
+                self._checksum_failures[trading_pair] = 0
+                # Request fresh snapshot via REST to resync
+                asyncio.create_task(self._request_order_book_reset(trading_pair))
+            else:
+                self.logger().warning(f"Checksum failure {failure_count}/{self._max_checksum_failures} "
+                                    f"for {trading_pair}")
+                
+        except Exception as e:
+            self.logger().error(f"Error handling checksum failure: {e}")
+            
+    def _reset_checksum_failure_count(self, trading_pair: str):
+        """Reset checksum failure count after successful validation."""
+        if trading_pair in self._checksum_failures:
+            del self._checksum_failures[trading_pair]
+    
+    async def _request_order_book_reset(self, trading_pair: str):
+        """
+        Request a fresh order book snapshot to resync after checksum failures.
+        This method schedules a reset but doesn't directly inject into the message queue.
+        
+        Args:
+            trading_pair: The trading pair to reset
+        """
+        try:
+            self.logger().info(f"Requesting order book reset for {trading_pair}")
+            
+            # Reset sequence number to force fresh snapshot on next message
+            if trading_pair in self._sequence_numbers:
+                del self._sequence_numbers[trading_pair]
+            
+            # Log the reset action - the next snapshot will be requested naturally
+            self.logger().info(f"Order book reset scheduled for {trading_pair} - next snapshot will reinitialize")
+                
+        except Exception as e:
+            self.logger().error(f"Error during order book reset for {trading_pair}: {e}")

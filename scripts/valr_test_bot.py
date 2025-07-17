@@ -140,7 +140,7 @@ class ValrTestBot(ScriptStrategyBase):
         self.log_with_clock(logging.INFO, "🚀 on_tick method called - bot is executing!")
         
         try:
-            # Check connector status immediately
+            # Check connector status immediately with timeout mechanism
             connector = self.connectors.get(self.config.exchange)
             if connector:
                 connector_ready = connector.ready
@@ -149,16 +149,48 @@ class ValrTestBot(ScriptStrategyBase):
                 if not connector_ready:
                     status = connector.status_dict
                     self.log_with_clock(logging.WARNING, f"Connector not ready - status: {status}")
+                    
+                    # Implement timeout mechanism for connector readiness
+                    if not hasattr(self, '_connector_wait_start'):
+                        self._connector_wait_start = self.current_timestamp
+                        self.log_with_clock(logging.INFO, "Starting connector readiness timeout timer")
+                    
+                    # Wait up to 2 minutes for connector to become ready
+                    wait_time = self.current_timestamp - self._connector_wait_start
+                    if wait_time > 120:  # 2 minutes timeout
+                        self.log_with_clock(logging.ERROR, f"Connector failed to become ready after {wait_time:.1f}s")
+                        self.log_with_clock(logging.ERROR, "Detailed status:")
+                        for key, value in status.items():
+                            status_icon = "✅" if value else "❌"
+                            self.log_with_clock(logging.ERROR, f"  {status_icon} {key}: {value}")
+                        self.log_with_clock(logging.ERROR, "Bot will continue attempting connection...")
+                        # Reset timer to prevent spam
+                        self._connector_wait_start = self.current_timestamp
+                    
                     return
+                else:
+                    # Connector is ready, reset any timeout tracking
+                    if hasattr(self, '_connector_wait_start'):
+                        wait_time = self.current_timestamp - self._connector_wait_start
+                        self.log_with_clock(logging.INFO, f"Connector became ready after {wait_time:.1f}s")
+                        delattr(self, '_connector_wait_start')
             else:
                 self.log_with_clock(logging.ERROR, "No connector found in on_tick")
                 return
             
-            # Run WebSocket test once at startup
+            # Run WebSocket test once at startup with timeout
             if not self.websocket_test_completed:
                 try:
-                    self.test_websocket_orderbook_access()
+                    # Use asyncio.wait_for to timeout the WebSocket test
+                    await asyncio.wait_for(
+                        self.test_websocket_orderbook_access_async(),
+                        timeout=30.0  # 30 second timeout
+                    )
                     self.websocket_test_completed = True
+                    self.log_with_clock(logging.INFO, "WebSocket test completed successfully")
+                except asyncio.TimeoutError:
+                    self.log_with_clock(logging.WARNING, "WebSocket test timed out after 30s, continuing without test")
+                    self.websocket_test_completed = True  # Don't let this block the bot
                 except Exception as ws_error:
                     self.log_with_clock(logging.WARNING, f"WebSocket test failed, continuing: {ws_error}")
                     self.websocket_test_completed = True  # Don't let this block the bot
@@ -169,43 +201,78 @@ class ValrTestBot(ScriptStrategyBase):
                 # Monitor order health before starting
                 self.monitor_order_health()
                 
-                # Cancel existing orders with validation
+                # Cancel existing orders with validation and timeout
                 cancellation_successful = True
                 active_orders = []
                 
                 try:
-                    active_orders = self.get_active_orders(connector_name=self.config.exchange)
+                    # Get active orders with timeout
+                    active_orders = await asyncio.wait_for(
+                        self.get_active_orders_async(connector_name=self.config.exchange),
+                        timeout=10.0
+                    )
+                    
                     if active_orders:
                         self.log_with_clock(logging.INFO, f"Cancelling {len(active_orders)} existing orders")
                         
-                        # Cancel each order individually and track success
+                        # Cancel each order individually and track success with timeout
                         cancelled_count = 0
                         for order in active_orders:
                             try:
-                                self.cancel(self.config.exchange, order.trading_pair, order.client_order_id)
+                                await asyncio.wait_for(
+                                    self.cancel_order_async(self.config.exchange, order.trading_pair, order.client_order_id),
+                                    timeout=5.0
+                                )
                                 cancelled_count += 1
                                 self.log_with_clock(logging.DEBUG, f"Cancelled order: {order.client_order_id}")
+                            except asyncio.TimeoutError:
+                                self.log_with_clock(logging.ERROR, f"Timeout cancelling order {order.client_order_id}")
+                                cancellation_successful = False
                             except Exception as cancel_error:
                                 self.log_with_clock(logging.ERROR, f"Failed to cancel order {order.client_order_id}: {cancel_error}")
                                 cancellation_successful = False
                         
-                        # Wait a moment for cancellations to process
-                        await asyncio.sleep(2)
+                        # Wait a moment for cancellations to process with timeout
+                        try:
+                            await asyncio.wait_for(asyncio.sleep(2), timeout=3.0)
+                        except asyncio.TimeoutError:
+                            self.log_with_clock(logging.WARNING, "Timeout waiting for cancellation processing")
                         
-                        # Check if orders were actually cancelled
-                        remaining_orders = self.get_active_orders(connector_name=self.config.exchange)
-                        if remaining_orders:
-                            self.log_with_clock(logging.WARNING, f"Still have {len(remaining_orders)} active orders after cancellation")
+                        # Check if orders were actually cancelled with timeout
+                        try:
+                            remaining_orders = await asyncio.wait_for(
+                                self.get_active_orders_async(connector_name=self.config.exchange),
+                                timeout=10.0
+                            )
+                            if remaining_orders:
+                                self.log_with_clock(logging.WARNING, f"Still have {len(remaining_orders)} active orders after cancellation")
+                                cancellation_successful = False
+                            else:
+                                self.log_with_clock(logging.INFO, f"Successfully cancelled {cancelled_count} orders")
+                        except asyncio.TimeoutError:
+                            self.log_with_clock(logging.WARNING, "Timeout checking remaining orders after cancellation")
                             cancellation_successful = False
-                        else:
-                            self.log_with_clock(logging.INFO, f"Successfully cancelled {cancelled_count} orders")
                             
+                except asyncio.TimeoutError:
+                    self.log_with_clock(logging.ERROR, "Timeout getting active orders for cancellation")
+                    cancellation_successful = False
                 except Exception as e:
                     self.log_with_clock(logging.ERROR, f"Error during order cancellation: {e}")
                     cancellation_successful = False
                 
                 # Safety check: Don't place new orders if we have too many already
-                current_active_orders = self.get_active_orders(connector_name=self.config.exchange)
+                try:
+                    current_active_orders = await asyncio.wait_for(
+                        self.get_active_orders_async(connector_name=self.config.exchange),
+                        timeout=10.0
+                    )
+                except asyncio.TimeoutError:
+                    self.log_with_clock(logging.ERROR, "Timeout getting active orders for safety check")
+                    current_active_orders = []
+                except Exception as e:
+                    self.log_with_clock(logging.ERROR, f"Error getting active orders for safety check: {e}")
+                    current_active_orders = []
+                    
                 max_allowed_orders = 10  # Safety limit
                 
                 if len(current_active_orders) >= max_allowed_orders:
@@ -234,13 +301,22 @@ class ValrTestBot(ScriptStrategyBase):
                         self.create_timestamp = self.config.order_refresh_time + self.current_timestamp
                         return
                     
-                    # Create and place new orders
+                    # Create and place new orders with timeout
                     try:
-                        proposal: List[OrderCandidate] = self.create_proposal()
+                        proposal: List[OrderCandidate] = await asyncio.wait_for(
+                            self.create_proposal_async(),
+                            timeout=15.0
+                        )
                         if proposal:
-                            proposal_adjusted: List[OrderCandidate] = self.adjust_proposal_to_budget(proposal)
+                            proposal_adjusted: List[OrderCandidate] = await asyncio.wait_for(
+                                self.adjust_proposal_to_budget_async(proposal),
+                                timeout=10.0
+                            )
                             if proposal_adjusted:
-                                self.place_orders(proposal_adjusted)
+                                await asyncio.wait_for(
+                                    self.place_orders_async(proposal_adjusted),
+                                    timeout=30.0
+                                )
                                 self.log_with_clock(
                                     logging.INFO, 
                                     f"Placed {len(proposal_adjusted)} orders, next refresh in {self.config.order_refresh_time}s"
@@ -249,6 +325,8 @@ class ValrTestBot(ScriptStrategyBase):
                                 self.log_with_clock(logging.WARNING, "No orders placed - insufficient budget")
                         else:
                             self.log_with_clock(logging.WARNING, "No orders created - unable to get reference price")
+                    except asyncio.TimeoutError:
+                        self.log_with_clock(logging.ERROR, "Timeout creating or placing orders")
                     except Exception as e:
                         self.log_with_clock(logging.ERROR, f"Error creating or placing orders: {e}")
                         # Don't crash on order placement errors
@@ -258,6 +336,10 @@ class ValrTestBot(ScriptStrategyBase):
                     
                 self.create_timestamp = self.config.order_refresh_time + self.current_timestamp
                 
+        except asyncio.TimeoutError:
+            self.log_with_clock(logging.ERROR, "Timeout in on_tick method - preventing freeze")
+            # Set next refresh time even on timeout to prevent tight loop
+            self.create_timestamp = self.config.order_refresh_time + self.current_timestamp
         except Exception as e:
             self.log_with_clock(logging.ERROR, f"Critical error in on_tick: {e}")
             # Set next refresh time even on error to prevent tight loop
@@ -536,8 +618,26 @@ class ValrTestBot(ScriptStrategyBase):
         except Exception as e:
             self.log_with_clock(logging.ERROR, f"Error monitoring order health: {e}")
     
+    async def test_websocket_orderbook_access_async(self):
+        """Test WebSocket orderbook access and mid price calculation (async version)"""
+        try:
+            self.log_with_clock(logging.INFO, "=" * 60)
+            self.log_with_clock(logging.INFO, "WEBSOCKET ORDERBOOK ACCESS TEST (ASYNC)")
+            self.log_with_clock(logging.INFO, "=" * 60)
+            
+            # Add small delay to allow async operations
+            await asyncio.sleep(0.1)
+            
+            # Call the sync version for the actual test logic
+            self.test_websocket_orderbook_access()
+            
+        except Exception as e:
+            self.log_with_clock(logging.ERROR, f"❌ Async WebSocket test failed: {e}")
+            import traceback
+            self.log_with_clock(logging.ERROR, f"Traceback: {traceback.format_exc()}")
+    
     def test_websocket_orderbook_access(self):
-        """Test WebSocket orderbook access and mid price calculation"""
+        """Test WebSocket orderbook access and mid price calculation (sync version - deprecated)"""
         try:
             self.log_with_clock(logging.INFO, "=" * 60)
             self.log_with_clock(logging.INFO, "WEBSOCKET ORDERBOOK ACCESS TEST")
@@ -651,3 +751,44 @@ class ValrTestBot(ScriptStrategyBase):
             self.log_with_clock(logging.ERROR, f"❌ WebSocket test failed: {e}")
             import traceback
             self.log_with_clock(logging.ERROR, f"Traceback: {traceback.format_exc()}")
+    
+    # Async helper methods to prevent blocking
+    async def get_active_orders_async(self, connector_name: str):
+        """Get active orders asynchronously"""
+        try:
+            return self.get_active_orders(connector_name=connector_name)
+        except Exception as e:
+            self.log_with_clock(logging.ERROR, f"Error getting active orders: {e}")
+            return []
+    
+    async def cancel_order_async(self, connector_name: str, trading_pair: str, client_order_id: str):
+        """Cancel order asynchronously"""
+        try:
+            return self.cancel(connector_name, trading_pair, client_order_id)
+        except Exception as e:
+            self.log_with_clock(logging.ERROR, f"Error cancelling order {client_order_id}: {e}")
+            raise
+    
+    async def create_proposal_async(self) -> List[OrderCandidate]:
+        """Create order proposal asynchronously"""
+        try:
+            return self.create_proposal()
+        except Exception as e:
+            self.log_with_clock(logging.ERROR, f"Error creating proposal: {e}")
+            return []
+    
+    async def adjust_proposal_to_budget_async(self, proposal: List[OrderCandidate]) -> List[OrderCandidate]:
+        """Adjust proposal to budget asynchronously"""
+        try:
+            return self.adjust_proposal_to_budget(proposal)
+        except Exception as e:
+            self.log_with_clock(logging.ERROR, f"Error adjusting proposal to budget: {e}")
+            return []
+    
+    async def place_orders_async(self, proposal: List[OrderCandidate]) -> None:
+        """Place orders asynchronously"""
+        try:
+            self.place_orders(proposal)
+        except Exception as e:
+            self.log_with_clock(logging.ERROR, f"Error placing orders: {e}")
+            raise

@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING
 
 from hummingbot.connector.exchange.valr import valr_constants as CONSTANTS, valr_web_utils as web_utils
 from hummingbot.connector.exchange.valr.valr_auth import ValrAuth
@@ -18,12 +18,12 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
     HEARTBEAT_TIME_INTERVAL = 30.0
     PING_TIMEOUT = 10.0
 
-    _logger: Optional[HummingbotLogger] = None
+    _logger: HummingbotLogger | None = None
 
     def __init__(
         self,
         auth: ValrAuth,
-        trading_pairs: List[str],
+        trading_pairs: list[str],
         connector: "ValrExchange",
         api_factory: WebAssistantsFactory,
         domain: str = CONSTANTS.DEFAULT_DOMAIN
@@ -35,6 +35,7 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._api_factory = api_factory
         self._domain = domain
         self._last_recv_time: float = 0  # Track last received time for REST fallback mode
+        self._ws_assistant: WSAssistant | None = None  # Store WebSocket assistant reference
     
     @property
     def last_recv_time(self) -> float:
@@ -130,6 +131,9 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
         # - Failed cancellations
         # - Cancel on disconnect events
         
+        # Enable cancel-on-disconnect feature
+        await self._enable_cancel_on_disconnect(websocket_assistant)
+        
         self.logger().info("User stream channels automatically subscribed after authentication")
 
     async def listen_for_user_stream(self, output: asyncio.Queue):
@@ -146,6 +150,7 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
         try:
             self.logger().info("Attempting to establish VALR WebSocket user stream connection")
             websocket_assistant = await self._connected_websocket_assistant()
+            self._ws_assistant = websocket_assistant  # Store the WebSocket assistant
             self.logger().info("Successfully established VALR WebSocket user stream connection")
             
             # Subscribe to user stream channels
@@ -165,7 +170,7 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         continue
                     elif event_message.upper() == "PING":
                         # Send PONG response
-                        await websocket_assistant.send({"type": "PONG"})
+                        await websocket_assistant.send(WSJSONRequest({"type": "PONG"}))
                         self.logger().debug("Sent PONG response to VALR")
                         continue
                 
@@ -214,6 +219,7 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
             # Clean up WebSocket connection
             if websocket_assistant is not None:
                 await websocket_assistant.disconnect()
+                self._ws_assistant = None  # Clear the reference
 
     async def _send_ping_messages(self, websocket_assistant):
         """
@@ -227,7 +233,7 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
             while True:
                 await asyncio.sleep(30)  # VALR requires ping every 30 seconds
                 try:
-                    await websocket_assistant.send({"type": "PING"})
+                    await websocket_assistant.send(WSJSONRequest({"type": "PING"}))
                     self.logger().debug("Sent PING message to VALR account WebSocket")
                 except Exception as e:
                     self.logger().warning(f"Failed to send PING message: {e}")
@@ -236,7 +242,7 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
             self.logger().debug("Ping task cancelled")
             raise
 
-    async def _on_user_stream_interruption(self, websocket_assistant: Optional[WSAssistant]):
+    async def _on_user_stream_interruption(self, websocket_assistant: WSAssistant | None):
         """
         Handles the event of a user stream interruption.
         
@@ -248,6 +254,53 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
         # Disconnect the websocket if it exists
         if websocket_assistant is not None:
             await websocket_assistant.disconnect()
+            self._ws_assistant = None  # Clear the reference
         
         # Additional cleanup can be added here if needed
         # The framework will automatically attempt to reconnect
+    
+    async def _enable_cancel_on_disconnect(self, websocket_assistant: WSAssistant):
+        """
+        Enable cancel-on-disconnect feature for VALR WebSocket.
+        This ensures that open orders are automatically cancelled if the WebSocket connection is lost.
+        
+        Args:
+            websocket_assistant: The WebSocket assistant to send the message through
+        """
+        try:
+            # Send cancel-on-disconnect activation message
+            cancel_on_disconnect_msg = WSJSONRequest({
+                "type": CONSTANTS.WS_CANCEL_ON_DISCONNECT_EVENT,
+                "data": {
+                    "active": True
+                }
+            })
+            
+            await websocket_assistant.send(cancel_on_disconnect_msg)
+            self.logger().info("Cancel-on-disconnect feature enabled for VALR account WebSocket")
+            
+        except Exception as e:
+            self.logger().warning(f"Failed to enable cancel-on-disconnect feature: {e}")
+    
+    async def _disable_cancel_on_disconnect(self, websocket_assistant: WSAssistant):
+        """
+        Disable cancel-on-disconnect feature for VALR WebSocket.
+        This allows orders to remain open even if the WebSocket connection is lost.
+        
+        Args:
+            websocket_assistant: The WebSocket assistant to send the message through
+        """
+        try:
+            # Send cancel-on-disconnect deactivation message
+            cancel_on_disconnect_msg = WSJSONRequest({
+                "type": CONSTANTS.WS_CANCEL_ON_DISCONNECT_EVENT,
+                "data": {
+                    "active": False
+                }
+            })
+            
+            await websocket_assistant.send(cancel_on_disconnect_msg)
+            self.logger().info("Cancel-on-disconnect feature disabled for VALR account WebSocket")
+            
+        except Exception as e:
+            self.logger().warning(f"Failed to disable cancel-on-disconnect feature: {e}")
