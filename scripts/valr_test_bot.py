@@ -404,6 +404,23 @@ class ValrTestBot(ScriptStrategyBase):
                                 self.log_with_clock(logging.DEBUG, f"✅ Cancelled order: {order_id}")
                             except Exception as cancel_error:
                                 self.log_with_clock(logging.ERROR, f"❌ Failed to cancel order {order_id}: {cancel_error}")
+                                
+                                # Enhanced error logging
+                                import traceback
+                                error_details = str(cancel_error)
+                                if hasattr(cancel_error, '__dict__'):
+                                    error_details += f" | Error attrs: {cancel_error.__dict__}"
+                                
+                                self.log_with_clock(logging.ERROR, f"❌ Cancellation error details: {error_details}")
+                                
+                                # Track specific error types
+                                if "timeout" in error_details.lower():
+                                    self.log_with_clock(logging.ERROR, f"⏱️ Timeout error during cancellation")
+                                elif "not found" in error_details.lower():
+                                    self.log_with_clock(logging.WARNING, f"⚠️ Order not found - may already be cancelled")
+                                elif "invalid" in error_details.lower():
+                                    self.log_with_clock(logging.ERROR, f"❌ Invalid order ID or parameters")
+                                
                                 cancellation_successful = False
                         
                         # Wait a moment for cancellations to process
@@ -411,28 +428,51 @@ class ValrTestBot(ScriptStrategyBase):
                         self.log_with_clock(logging.DEBUG, "⏳ Waiting 2s for cancellations to process...")
                         time.sleep(2)
                         
-                        # Check if orders were actually cancelled using comprehensive method
-                        try:
-                            remaining_orders = self.get_all_active_orders_comprehensive(connector_name=self.config.exchange)
+                        # CRITICAL: Validate cancellation via REST API
+                        cancelled_order_ids = []
+                        for order in active_orders:
+                            order_id = None
+                            if hasattr(order, 'client_order_id') and order.client_order_id:
+                                order_id = order.client_order_id
+                            elif hasattr(order, 'exchange_order_id') and order.exchange_order_id:
+                                order_id = order.exchange_order_id
+                            elif isinstance(order, dict):
+                                order_id = order.get('client_order_id')
                             
-                            self.log_with_clock(logging.INFO, f"📊 After cancellation: {len(remaining_orders)} orders remaining")
+                            if order_id:
+                                cancelled_order_ids.append(order_id)
+                        
+                        # Validate that orders were actually cancelled
+                        if cancelled_order_ids:
+                            validation_successful = self._validate_cancellation_via_rest(self.config.exchange, cancelled_order_ids)
                             
-                            if remaining_orders:
-                                self.log_with_clock(logging.WARNING, f"⚠️ Still have {len(remaining_orders)} active orders after cancellation")
-                                for i, order in enumerate(remaining_orders):
-                                    # Get order ID for logging
-                                    if hasattr(order, 'client_order_id'):
-                                        order_id = order.client_order_id
-                                    elif hasattr(order, 'exchange_order_id'):
-                                        order_id = order.exchange_order_id
+                            if not validation_successful:
+                                self.log_with_clock(logging.ERROR, f"❌ Cancellation validation failed - orders still exist on exchange")
+                                
+                                # Get orders that still exist and retry cancellation
+                                remaining_orders = self.get_all_active_orders_comprehensive(connector_name=self.config.exchange)
+                                
+                                if remaining_orders:
+                                    self.log_with_clock(logging.WARNING, f"🔄 Attempting to retry cancellation for {len(remaining_orders)} remaining orders")
+                                    
+                                    # Try to retry cancellation
+                                    retry_successful = self._retry_failed_cancellations(self.config.exchange, remaining_orders)
+                                    
+                                    if retry_successful:
+                                        self.log_with_clock(logging.INFO, f"✅ Retry cancellation successful")
+                                        cancellation_successful = True
                                     else:
-                                        order_id = str(order)
-                                    self.log_with_clock(logging.WARNING, f"  Remaining {i+1}: {order_id}")
-                                cancellation_successful = False
+                                        self.log_with_clock(logging.ERROR, f"❌ Retry cancellation failed - orders still exist")
+                                        cancellation_successful = False
+                                else:
+                                    # No orders found in comprehensive check - validation might be wrong
+                                    self.log_with_clock(logging.WARNING, f"⚠️ Validation failed but no orders found - may be timing issue")
+                                    cancellation_successful = True
                             else:
-                                self.log_with_clock(logging.INFO, f"✅ Successfully cancelled all {cancelled_count} orders")
-                        except Exception as e:
-                            self.log_with_clock(logging.WARNING, f"❌ Error checking remaining orders after cancellation: {e}")
+                                self.log_with_clock(logging.INFO, f"✅ Cancellation validated successfully - all {len(cancelled_order_ids)} orders cancelled")
+                                cancellation_successful = True
+                        else:
+                            self.log_with_clock(logging.WARNING, f"⚠️ No order IDs found for validation")
                             cancellation_successful = False
                     else:
                         self.log_with_clock(logging.INFO, "ℹ️ No active orders to cancel")
@@ -459,6 +499,34 @@ class ValrTestBot(ScriptStrategyBase):
                 
                 # Enhanced condition: only place orders if cancellation was successful OR very few orders
                 should_place_orders = cancellation_successful or len(current_active_orders) <= 2
+                
+                # RECOVERY LOGIC: If cancellation failed but we're not at safety limit, try emergency recovery
+                if not should_place_orders and len(current_active_orders) < max_allowed_orders:
+                    # Check if we've been stuck in this state for too long
+                    if not hasattr(self, '_cancellation_failure_count'):
+                        self._cancellation_failure_count = 0
+                        self._last_successful_refresh = self.current_timestamp
+                    
+                    self._cancellation_failure_count += 1
+                    time_since_success = self.current_timestamp - getattr(self, '_last_successful_refresh', self.current_timestamp)
+                    
+                    self.log_with_clock(logging.WARNING, f"🔄 Recovery mode: {self._cancellation_failure_count} failed attempts, {time_since_success:.0f}s since last successful refresh")
+                    
+                    # After 3 failed attempts or 2 minutes, force recovery
+                    if self._cancellation_failure_count >= 3 or time_since_success >= 120:
+                        self.log_with_clock(logging.WARNING, f"🚨 Emergency recovery triggered - forcing order placement despite cancellation failure")
+                        
+                        # Clear all tracking data and start fresh
+                        self.placed_orders.clear()
+                        self.log_with_clock(logging.INFO, f"🧹 Emergency cleanup: cleared all tracking data")
+                        
+                        # Reset failure count
+                        self._cancellation_failure_count = 0
+                        self._last_successful_refresh = self.current_timestamp
+                        
+                        # Force order placement
+                        should_place_orders = True
+                        self.log_with_clock(logging.INFO, f"🔄 Emergency recovery: allowing new order placement")
                 
                 if should_place_orders:
                     # Verify connector is still ready before placing orders
@@ -518,6 +586,12 @@ class ValrTestBot(ScriptStrategyBase):
                                         self.log_with_clock(logging.WARNING, f"⚠️ High order count after placement: {len(final_orders)} orders")
                                     elif len(final_orders) == 2:
                                         self.log_with_clock(logging.INFO, f"✅ Perfect order count: {len(final_orders)} orders")
+                                        
+                                        # Reset failure tracking on successful cycle
+                                        if hasattr(self, '_cancellation_failure_count'):
+                                            self._cancellation_failure_count = 0
+                                        self._last_successful_refresh = self.current_timestamp
+                                        
                                 except Exception as e:
                                     self.log_with_clock(logging.WARNING, f"❌ Error checking final order count: {e}")
                             else:
@@ -532,6 +606,12 @@ class ValrTestBot(ScriptStrategyBase):
                     self.log_with_clock(logging.INFO, f"Current active orders: {len(current_active_orders)}")
                     
                 self.create_timestamp = self.config.order_refresh_time + self.current_timestamp
+                
+                # Enhanced logging for cycle completion
+                if cancellation_successful:
+                    self.log_with_clock(logging.INFO, f"✅ Order refresh cycle completed successfully - next refresh at {self.create_timestamp}")
+                else:
+                    self.log_with_clock(logging.WARNING, f"⚠️ Order refresh cycle completed with issues - next refresh at {self.create_timestamp}")
                 
         except Exception as e:
             self.log_with_clock(logging.ERROR, f"Critical error in on_tick: {e}")
@@ -900,27 +980,40 @@ class ValrTestBot(ScriptStrategyBase):
                 f"Comprehensive order check - Connector: {len(connector_orders)}, Strategy: {len(strategy_orders)}, Tracked: {len(tracked_orders)}"
             )
             
-            # Prioritize orders with proper IDs (connector orders) over tracked orders
-            # This ensures cancellation will work properly
+            # CRITICAL FIX: Trust connector state as primary source of truth
+            # The connector represents the actual exchange state, not our internal tracking
+            
+            # Always trust connector orders first (real exchange state)
             if connector_orders:
-                max_count = len(connector_orders)
                 primary_source = "connector"
                 result_orders = connector_orders
+                self.log_with_clock(logging.INFO, f"✅ Using connector orders: {len(connector_orders)} (exchange reality)")
+                
+                # Clean up stale tracking data if it doesn't match reality
+                if len(tracked_orders) > len(connector_orders):
+                    excess_count = len(tracked_orders) - len(connector_orders)
+                    self.log_with_clock(logging.WARNING, f"🧹 Cleaning {excess_count} stale tracked orders")
+                    self._cleanup_stale_tracking(connector_orders)
+                    
+            # Fallback to strategy orders if connector fails
             elif strategy_orders:
-                max_count = len(strategy_orders)
                 primary_source = "strategy"
                 result_orders = strategy_orders
+                self.log_with_clock(logging.INFO, f"⚠️ Using strategy orders: {len(strategy_orders)} (connector may be delayed)")
+                
+            # Only use tracked orders if both connector and strategy fail
             elif tracked_orders:
-                max_count = len(tracked_orders)
                 primary_source = "tracked"
                 result_orders = tracked_orders
+                self.log_with_clock(logging.WARNING, f"🔄 Using tracked orders: {len(tracked_orders)} (fallback mode)")
+                
             else:
-                max_count = 0
                 primary_source = "none"
                 result_orders = []
+                self.log_with_clock(logging.INFO, "ℹ️ No orders found in any source")
             
             # If there are significant differences, log warnings
-            if max_count > 0:
+            if result_orders:
                 counts = [len(connector_orders), len(strategy_orders), len(tracked_orders)]
                 if max(counts) - min(counts) > 1:
                     self.log_with_clock(
@@ -930,7 +1023,7 @@ class ValrTestBot(ScriptStrategyBase):
             
             # Return the prioritized source (connector orders preferred for proper cancellation)
             if result_orders:
-                self.log_with_clock(logging.DEBUG, f"Using {primary_source} orders (prioritized for proper cancellation)")
+                self.log_with_clock(logging.DEBUG, f"Using {primary_source} orders (exchange reality)")
                 return result_orders
             else:
                 self.log_with_clock(logging.DEBUG, "No active orders found in any source")
@@ -943,6 +1036,143 @@ class ValrTestBot(ScriptStrategyBase):
                 return self.get_active_orders(connector_name)
             except:
                 return []
+
+    def _cleanup_stale_tracking(self, current_orders: List):
+        """
+        Clean up stale tracking data by removing orders that don't exist in the current order list.
+        """
+        try:
+            # Get current order IDs from connector
+            current_order_ids = set()
+            for order in current_orders:
+                if hasattr(order, 'client_order_id') and order.client_order_id:
+                    current_order_ids.add(order.client_order_id)
+                elif hasattr(order, 'exchange_order_id') and order.exchange_order_id:
+                    current_order_ids.add(order.exchange_order_id)
+            
+            # Remove tracked orders that don't exist in current orders
+            stale_keys = []
+            for key, order_info in self.placed_orders.items():
+                if isinstance(order_info, dict):
+                    tracked_id = order_info.get('client_order_id')
+                    if tracked_id and tracked_id not in current_order_ids:
+                        stale_keys.append(key)
+                elif key not in current_order_ids:
+                    stale_keys.append(key)
+            
+            # Remove stale entries
+            for key in stale_keys:
+                del self.placed_orders[key]
+                self.log_with_clock(logging.DEBUG, f"🧹 Removed stale tracking for: {key}")
+            
+            if stale_keys:
+                self.log_with_clock(logging.INFO, f"🧹 Cleaned up {len(stale_keys)} stale tracking entries")
+            
+        except Exception as e:
+            self.log_with_clock(logging.ERROR, f"Error cleaning up stale tracking: {e}")
+
+    def _validate_cancellation_via_rest(self, connector_name: str, order_ids: List[str]) -> bool:
+        """
+        Validate that orders were actually cancelled by checking directly via REST API.
+        This is critical because the cancellation might appear successful but fail silently.
+        """
+        try:
+            connector = self.connectors[connector_name]
+            
+            # Check if orders still exist via REST API
+            if hasattr(connector, 'get_open_orders'):
+                # Try to get open orders directly from the exchange
+                open_orders = connector.get_open_orders()
+                
+                # Check if any of our cancelled orders are still in the open orders
+                still_open = []
+                for order_id in order_ids:
+                    for open_order in open_orders:
+                        if (hasattr(open_order, 'client_order_id') and open_order.client_order_id == order_id) or \
+                           (hasattr(open_order, 'exchange_order_id') and open_order.exchange_order_id == order_id):
+                            still_open.append(order_id)
+                
+                if still_open:
+                    self.log_with_clock(logging.ERROR, f"❌ REST validation failed: {len(still_open)} orders still open: {still_open}")
+                    return False
+                else:
+                    self.log_with_clock(logging.INFO, f"✅ REST validation passed: All {len(order_ids)} orders cancelled successfully")
+                    return True
+                    
+            else:
+                # Fallback: check if the connector's internal tracking shows fewer orders
+                current_orders = self.get_connector_active_orders(connector_name)
+                if len(current_orders) == 0:
+                    self.log_with_clock(logging.INFO, f"✅ Connector validation passed: No active orders found")
+                    return True
+                else:
+                    self.log_with_clock(logging.WARNING, f"⚠️ Connector validation: {len(current_orders)} orders still active")
+                    return False
+                    
+        except Exception as e:
+            self.log_with_clock(logging.ERROR, f"❌ Error validating cancellation via REST: {e}")
+            return False
+
+    def _retry_failed_cancellations(self, connector_name: str, failed_orders: List, max_retries: int = 3) -> bool:
+        """
+        Retry cancellation for orders that failed to cancel on the first attempt.
+        """
+        try:
+            self.log_with_clock(logging.INFO, f"🔄 Retrying cancellation for {len(failed_orders)} orders (max {max_retries} attempts)")
+            
+            for retry in range(max_retries):
+                if not failed_orders:
+                    break
+                    
+                self.log_with_clock(logging.INFO, f"🔄 Retry attempt {retry + 1}/{max_retries}")
+                
+                # Try to cancel each failed order
+                still_failed = []
+                for order in failed_orders:
+                    try:
+                        order_id = None
+                        if hasattr(order, 'client_order_id') and order.client_order_id:
+                            order_id = order.client_order_id
+                        elif hasattr(order, 'exchange_order_id') and order.exchange_order_id:
+                            order_id = order.exchange_order_id
+                        elif isinstance(order, dict):
+                            order_id = order.get('client_order_id')
+                        
+                        if order_id:
+                            self.log_with_clock(logging.DEBUG, f"🔄 Retry cancelling order: {order_id}")
+                            self.cancel_order(self.market_trading_pair_tuple, order_id)
+                            
+                            # Wait a bit for cancellation to process
+                            import time
+                            time.sleep(1)
+                            
+                        else:
+                            self.log_with_clock(logging.WARNING, f"⚠️ Cannot retry order without valid ID: {order}")
+                            still_failed.append(order)
+                            
+                    except Exception as e:
+                        self.log_with_clock(logging.ERROR, f"❌ Retry failed for order {order_id}: {e}")
+                        still_failed.append(order)
+                
+                # Check if retries worked
+                if not still_failed:
+                    self.log_with_clock(logging.INFO, f"✅ All retries successful after {retry + 1} attempts")
+                    return True
+                    
+                failed_orders = still_failed
+                
+                # Wait before next retry
+                if retry < max_retries - 1:
+                    import time
+                    time.sleep(2)
+            
+            # If we get here, some orders still failed
+            self.log_with_clock(logging.ERROR, f"❌ {len(failed_orders)} orders failed all {max_retries} retry attempts")
+            return False
+            
+        except Exception as e:
+            self.log_with_clock(logging.ERROR, f"❌ Error during retry cancellation: {e}")
+            return False
 
     def track_placed_order(self, order_side: str, amount: Decimal, price: Decimal, client_order_id: str = None):
         """
