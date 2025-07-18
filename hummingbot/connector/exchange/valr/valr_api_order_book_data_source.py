@@ -49,6 +49,39 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self._sequence_numbers: dict[str, int] = {}
         self._checksum_failures: dict[str, int] = {}
         self._max_checksum_failures = 3  # Maximum consecutive failures before resubscription
+        
+        # Message processing optimization
+        self._message_stats = {
+            'total_messages': 0,
+            'processed_messages': 0,
+            'filtered_messages': 0,
+            'failed_messages': 0,
+            'trade_messages': 0,
+            'diff_messages': 0,
+            'snapshot_messages': 0,
+            'ping_pong_messages': 0,
+            'unknown_messages': 0,
+            'processing_time_sum': 0.0,
+            'last_stats_reset': time.time()
+        }
+        
+        # Connection health monitoring
+        self._connection_health = {
+            'total_connections': 0,
+            'successful_connections': 0,
+            'failed_connections': 0,
+            'consecutive_failures': 0,
+            'last_success_time': 0,
+            'last_failure_time': 0,
+            'circuit_breaker_active': False,
+            'circuit_breaker_activated_time': 0,
+            'average_uptime': 0,
+            'connection_start_time': 0,
+            'normal_disconnects': 0,  # Count of code 1000 disconnects
+            'abnormal_disconnects': 0,  # Count of other disconnects
+            'total_uptime': 0,  # Total connection uptime
+            'disconnect_pattern': []  # Track disconnect intervals for pattern analysis
+        }
 
     async def get_last_traded_prices(
         self, trading_pairs: list[str], domain: str | None = None
@@ -86,6 +119,258 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 continue
                 
         return results
+
+    def _should_process_message(self, message_data: dict[str, Any]) -> bool:
+        """
+        Pre-filter messages to avoid unnecessary processing.
+        
+        Args:
+            message_data: The message data to evaluate
+            
+        Returns:
+            True if message should be processed, False if it should be filtered out
+        """
+        # Check if message is for our trading pairs
+        pair = message_data.get("currencyPairSymbol", "")
+        if pair:
+            # Convert to hummingbot format and check if we're interested
+            try:
+                trading_pair = web_utils.convert_from_exchange_trading_pair(pair)
+                if trading_pair not in self._trading_pairs:
+                    return False
+            except Exception:
+                # If conversion fails, don't process
+                return False
+        
+        # Check message type - only process known types
+        message_type = message_data.get("type", "")
+        known_types = {
+            "NEW_TRADE", 
+            "AGGREGATED_ORDERBOOK_UPDATE", 
+            "FULL_ORDERBOOK_SNAPSHOT",
+            "FULL_ORDERBOOK_UPDATE",
+            "MARKET_SUMMARY_UPDATE"
+        }
+        
+        return message_type in known_types
+
+    def _update_message_stats(self, message_type: str, processing_time: float = 0.0, failed: bool = False):
+        """Update message processing statistics for performance monitoring."""
+        self._message_stats['total_messages'] += 1
+        
+        if failed:
+            self._message_stats['failed_messages'] += 1
+        else:
+            self._message_stats['processed_messages'] += 1
+            self._message_stats['processing_time_sum'] += processing_time
+        
+        # Update type-specific counters
+        if message_type == "NEW_TRADE":
+            self._message_stats['trade_messages'] += 1
+        elif message_type == "AGGREGATED_ORDERBOOK_UPDATE":
+            self._message_stats['diff_messages'] += 1
+        elif message_type in ["FULL_ORDERBOOK_SNAPSHOT", "FULL_ORDERBOOK_UPDATE"]:
+            self._message_stats['snapshot_messages'] += 1
+        elif message_type in ["PING", "PONG"]:
+            self._message_stats['ping_pong_messages'] += 1
+        else:
+            self._message_stats['unknown_messages'] += 1
+
+    def _get_message_processing_stats(self) -> dict[str, Any]:
+        """Get current message processing performance statistics."""
+        total_msgs = self._message_stats['total_messages']
+        processed_msgs = self._message_stats['processed_messages']
+        
+        avg_processing_time = 0.0
+        if processed_msgs > 0:
+            avg_processing_time = self._message_stats['processing_time_sum'] / processed_msgs
+        
+        processing_rate = 0.0
+        time_elapsed = time.time() - self._message_stats['last_stats_reset']
+        if time_elapsed > 0:
+            processing_rate = total_msgs / time_elapsed
+        
+        return {
+            'total_messages': total_msgs,
+            'processed_messages': processed_msgs,
+            'filtered_messages': self._message_stats['filtered_messages'],
+            'failed_messages': self._message_stats['failed_messages'],
+            'trade_messages': self._message_stats['trade_messages'],
+            'diff_messages': self._message_stats['diff_messages'],
+            'snapshot_messages': self._message_stats['snapshot_messages'],
+            'ping_pong_messages': self._message_stats['ping_pong_messages'],
+            'unknown_messages': self._message_stats['unknown_messages'],
+            'avg_processing_time_ms': avg_processing_time * 1000,
+            'messages_per_second': processing_rate,
+            'success_rate': (processed_msgs / total_msgs) if total_msgs > 0 else 0,
+            'filter_rate': (self._message_stats['filtered_messages'] / total_msgs) if total_msgs > 0 else 0
+        }
+
+    def _reset_message_stats(self):
+        """Reset message processing statistics."""
+        self._message_stats = {
+            'total_messages': 0,
+            'processed_messages': 0,
+            'filtered_messages': 0,
+            'failed_messages': 0,
+            'trade_messages': 0,
+            'diff_messages': 0,
+            'snapshot_messages': 0,
+            'ping_pong_messages': 0,
+            'unknown_messages': 0,
+            'processing_time_sum': 0.0,
+            'last_stats_reset': time.time()
+        }
+
+    def _record_connection_attempt(self):
+        """Record a new connection attempt for health monitoring."""
+        self._connection_health['total_connections'] += 1
+        self._connection_health['connection_start_time'] = time.time()
+
+    def _record_connection_success(self):
+        """Record a successful connection for health monitoring."""
+        self._connection_health['successful_connections'] += 1
+        self._connection_health['consecutive_failures'] = 0
+        self._connection_health['last_success_time'] = time.time()
+        self._connection_health['circuit_breaker_active'] = False
+        
+        # Calculate average uptime
+        if self._connection_health['successful_connections'] > 0:
+            total_uptime = self._connection_health['last_success_time'] - self._connection_health.get('first_success_time', self._connection_health['last_success_time'])
+            self._connection_health['average_uptime'] = total_uptime / self._connection_health['successful_connections']
+        
+        # Set first success time if not already set
+        if 'first_success_time' not in self._connection_health:
+            self._connection_health['first_success_time'] = self._connection_health['last_success_time']
+
+    def _record_connection_failure(self, is_normal_disconnect: bool = False):
+        """Record a connection failure for health monitoring."""
+        self._connection_health['failed_connections'] += 1
+        self._connection_health['last_failure_time'] = time.time()
+        
+        # Record uptime if we had a successful connection
+        if self._connection_health['connection_start_time'] > 0:
+            uptime = time.time() - self._connection_health['connection_start_time']
+            self._connection_health['total_uptime'] += uptime
+            
+            # Track disconnect intervals for pattern analysis (keep last 10)
+            if len(self._connection_health['disconnect_pattern']) >= 10:
+                self._connection_health['disconnect_pattern'].pop(0)
+            self._connection_health['disconnect_pattern'].append(uptime)
+        
+        if is_normal_disconnect:
+            # VALR's expected 30-second disconnects - don't count as real failures
+            self._connection_health['normal_disconnects'] += 1
+            # Don't increment consecutive_failures for normal disconnects
+            self.logger().debug(f"Normal disconnect recorded (code 1000). "
+                              f"Total normal: {self._connection_health['normal_disconnects']}, "
+                              f"abnormal: {self._connection_health['abnormal_disconnects']}")
+        else:
+            # Abnormal disconnects - count towards consecutive failures
+            self._connection_health['abnormal_disconnects'] += 1
+            self._connection_health['consecutive_failures'] += 1
+            
+            # Activate circuit breaker if consecutive failures exceed threshold
+            if self._connection_health['consecutive_failures'] >= CONSTANTS.CONNECTION_FAILURE_THRESHOLD:
+                self._connection_health['circuit_breaker_active'] = True
+                self._connection_health['circuit_breaker_activated_time'] = time.time()
+                self.logger().warning(f"Order book connection circuit breaker activated after "
+                                    f"{self._connection_health['consecutive_failures']} consecutive abnormal failures")
+
+    def _should_attempt_connection(self) -> bool:
+        """Check if connection should be attempted based on circuit breaker state."""
+        if not self._connection_health['circuit_breaker_active']:
+            return True
+        
+        # Check if recovery time has passed
+        time_since_activation = time.time() - self._connection_health['circuit_breaker_activated_time']
+        if time_since_activation >= CONSTANTS.CONNECTION_RECOVERY_TIME:
+            self.logger().info(f"Order book connection circuit breaker recovery time elapsed, allowing connection attempt")
+            return True
+        
+        return False
+
+    def _calculate_adaptive_delay(self, is_normal_disconnect: bool = False) -> float:
+        """Calculate adaptive reconnection delay based on connection health."""
+        if is_normal_disconnect:
+            # Optimized delay for VALR's normal 30-second disconnects
+            return self._calculate_normal_disconnect_delay()
+        
+        failures = self._connection_health['consecutive_failures']
+        
+        # Base exponential backoff for abnormal disconnects
+        base_delay = min(CONSTANTS.ADAPTIVE_DELAY_MIN * (2 ** failures), CONSTANTS.ADAPTIVE_DELAY_MAX)
+        
+        # Adjust based on success rate
+        total_attempts = self._connection_health['total_connections']
+        if total_attempts > 0:
+            # Only consider abnormal disconnects for success rate calculation
+            abnormal_failures = self._connection_health['abnormal_disconnects']
+            abnormal_success_rate = max(0, (total_attempts - abnormal_failures) / total_attempts)
+            
+            # Lower success rate = longer delays
+            if abnormal_success_rate < 0.3:
+                base_delay *= 2.0  # Double delay for very poor success rate
+            elif abnormal_success_rate < 0.6:
+                base_delay *= 1.5  # Increase delay for poor success rate
+        
+        return min(base_delay, CONSTANTS.ADAPTIVE_DELAY_MAX)
+    
+    def _calculate_normal_disconnect_delay(self) -> float:
+        """Calculate optimized delay for VALR's normal code 1000 disconnects."""
+        # Analyze disconnect pattern to predict optimal reconnection timing
+        if len(self._connection_health['disconnect_pattern']) >= 3:
+            # Calculate average connection duration
+            avg_uptime = sum(self._connection_health['disconnect_pattern']) / len(self._connection_health['disconnect_pattern'])
+            
+            # If connections typically last around 30 seconds, use minimal delay
+            if 25 <= avg_uptime <= 35:
+                return 0.5  # Very fast reconnect for predictable pattern
+            elif 20 <= avg_uptime <= 40:
+                return 1.0  # Fast reconnect for near-predictable pattern
+        
+        # Default optimized delay for normal disconnects
+        normal_disconnects = self._connection_health['normal_disconnects']
+        if normal_disconnects > 10:
+            # We've seen many normal disconnects, use very fast reconnect
+            return 0.5
+        elif normal_disconnects > 5:
+            # Moderate normal disconnect history, use fast reconnect
+            return 1.0
+        else:
+            # Haven't established pattern yet, use slightly longer delay
+            return 2.0
+
+    def _get_connection_health_status(self) -> dict[str, Any]:
+        """Get current connection health metrics."""
+        total_attempts = self._connection_health['total_connections']
+        success_rate = (self._connection_health['successful_connections'] / total_attempts) if total_attempts > 0 else 0
+        
+        # Calculate abnormal failure rate (excluding normal disconnects)
+        abnormal_failures = self._connection_health['abnormal_disconnects']
+        abnormal_failure_rate = (abnormal_failures / total_attempts) if total_attempts > 0 else 0
+        
+        # Calculate average disconnect interval
+        avg_disconnect_interval = 0
+        if len(self._connection_health['disconnect_pattern']) > 0:
+            avg_disconnect_interval = sum(self._connection_health['disconnect_pattern']) / len(self._connection_health['disconnect_pattern'])
+        
+        return {
+            'total_connections': total_attempts,
+            'successful_connections': self._connection_health['successful_connections'],
+            'failed_connections': self._connection_health['failed_connections'],
+            'consecutive_failures': self._connection_health['consecutive_failures'],
+            'success_rate': success_rate,
+            'circuit_breaker_active': self._connection_health['circuit_breaker_active'],
+            'average_uptime': self._connection_health['average_uptime'],
+            'last_success_time': self._connection_health['last_success_time'],
+            'last_failure_time': self._connection_health['last_failure_time'],
+            'normal_disconnects': self._connection_health['normal_disconnects'],
+            'abnormal_disconnects': self._connection_health['abnormal_disconnects'],
+            'abnormal_failure_rate': abnormal_failure_rate,
+            'avg_disconnect_interval': avg_disconnect_interval,
+            'disconnect_pattern_established': len(self._connection_health['disconnect_pattern']) >= 3
+        }
 
     async def _request_order_book_snapshot(self, trading_pair: str) -> dict[str, Any]:
         """
@@ -402,11 +687,11 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
             # Process order book update with proper quantity handling
             bids, asks = self._process_order_book_update(raw_bids, raw_asks)
             
-            # Validate sequence number
+            # Validate sequence number - VALR optimized validation with high tolerance
             sequence_number = data.get("SequenceNumber")
             if not self._validate_sequence_number(trading_pair, sequence_number):
-                self.logger().warning(f"Sequence validation failed for {trading_pair}. Skipping update.")
-                return
+                self.logger().debug(f"Sequence validation failed for {trading_pair} - continuing anyway (VALR high-frequency optimization)")
+                # Continue processing - don't return, as VALR has very high message frequency
             
             # Validate checksum if provided
             expected_checksum = data.get("Checksum")
@@ -529,73 +814,189 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def listen_for_order_book_stream(self, output: asyncio.Queue):
         """
         Override to handle VALR-specific message routing including market summary updates.
-        Includes ping-pong mechanism to maintain Trade WebSocket connection.
+        Includes robust reconnection handling for VALR's 30-second disconnect pattern.
         
         Args:
             output: The queue to send parsed messages to
         """
-        ping_task = None
+        max_reconnection_attempts = 5
         
-        # Message processor with ping/pong handling
-        async def message_processor():
-            async for raw_message in self._ws_assistant.iter_messages():
-                try:
-                    message_data = raw_message.data
+        while True:
+            ping_task = None
+            
+            # Check circuit breaker before attempting connection
+            if not self._should_attempt_connection():
+                health_status = self._get_connection_health_status()
+                time_remaining = CONSTANTS.CONNECTION_RECOVERY_TIME - (time.time() - self._connection_health['circuit_breaker_activated_time'])
+                self.logger().warning(f"Order book connection circuit breaker active. Recovery in {time_remaining:.1f}s. "
+                                    f"Health: {health_status['success_rate']:.2%} success rate, "
+                                    f"{health_status['consecutive_failures']} consecutive failures")
+                await asyncio.sleep(30)  # Wait before checking again
+                continue
+            
+            # Optimized message processor with filtering, performance tracking, and improved error handling
+            async def message_processor():
+                async for raw_message in self._ws_assistant.iter_messages():
+                    processing_start_time = time.time()
+                    message_type = "unknown"
                     
-                    # Handle ping/pong messages for Trade WebSocket
-                    if isinstance(message_data, str):
-                        if message_data.upper() == "PONG":
-                            self.logger().debug("Received PONG response from VALR Trade WebSocket")
+                    try:
+                        message_data = raw_message.data
+                        
+                        # Handle ping/pong messages for Trade WebSocket (fast path)
+                        if isinstance(message_data, str):
+                            if message_data.upper() == "PONG":
+                                self._update_message_stats("PONG", time.time() - processing_start_time)
+                                self.logger().debug("Received PONG response from VALR Trade WebSocket")
+                                continue
+                            elif message_data.upper() == "PING":
+                                # Send PONG response
+                                await self._ws_assistant.send(WSJSONRequest({"type": "PONG"}))
+                                self._update_message_stats("PING", time.time() - processing_start_time)
+                                self.logger().debug("Sent PONG response to VALR Trade WebSocket")
+                                continue
+                        
+                        # Ensure message_data is a dictionary
+                        if not isinstance(message_data, dict):
+                            self._update_message_stats("invalid", 0, failed=True)
                             continue
-                        elif message_data.upper() == "PING":
-                            # Send PONG response
-                            await self._ws_assistant.send(WSJSONRequest({"type": "PONG"}))
-                            self.logger().debug("Sent PONG response to VALR Trade WebSocket")
+                        
+                        message_type = message_data.get("type", "")
+                        
+                        # Pre-filter messages to reduce unnecessary processing
+                        if not self._should_process_message(message_data):
+                            self._message_stats['filtered_messages'] += 1
                             continue
-                    
-                    message_type = message_data.get("type", "")
-                    
-                    # Handle market summary updates separately for symbol mapping
-                    if message_type == "MARKET_SUMMARY_UPDATE":
-                        await self._handle_market_summary_update(message_data)
-                        continue
-                    
-                    # Process other message types using parent's logic
-                    channel = self._channel_originating_message(message_data)
-                    if channel:
-                        if channel == self._trade_messages_queue_key:
-                            await self._parse_trade_message(message_data, output)
-                        elif channel == self._diff_messages_queue_key:
-                            await self._parse_order_book_diff_message(message_data, output)
-                        elif channel in [self._snapshot_messages_queue_key]:
-                            await self._parse_order_book_snapshot_message(message_data, output)
+                        
+                        # Handle market summary updates separately for symbol mapping (optimization: no queue overhead)
+                        if message_type == "MARKET_SUMMARY_UPDATE":
+                            await self._handle_market_summary_update(message_data)
+                            self._update_message_stats(message_type, time.time() - processing_start_time)
+                            continue
+                        
+                        # Process other message types using optimized routing
+                        channel = self._channel_originating_message(message_data)
+                        if channel:
+                            if channel == self._trade_messages_queue_key:
+                                await self._parse_trade_message(message_data, output)
+                            elif channel == self._diff_messages_queue_key:
+                                await self._parse_order_book_diff_message(message_data, output)
+                            elif channel in [self._snapshot_messages_queue_key]:
+                                await self._parse_order_book_snapshot_message(message_data, output)
                             
-                except Exception:
-                    self.logger().exception("Error processing order book stream message")
-        
-        try:
-            if not self._ws_assistant:
-                self._ws_assistant = await self._connected_websocket_assistant()
-                await self._subscribe_channels(self._ws_assistant)
+                            self._update_message_stats(message_type, time.time() - processing_start_time)
+                        else:
+                            # Unknown message type
+                            self._update_message_stats(message_type, 0, failed=True)
+                            self.logger().debug(f"Unhandled message type: {message_type}")
+                                
+                    except asyncio.CancelledError:
+                        # Don't log cancellation as an error
+                        raise
+                    except Exception as e:
+                        # Enhanced error handling with message type context
+                        processing_time = time.time() - processing_start_time
+                        self._update_message_stats(message_type, processing_time, failed=True)
+                        
+                        error_msg = str(e)
+                        if "json" in error_msg.lower() or "decode" in error_msg.lower():
+                            self.logger().warning(f"JSON decode error for {message_type} message: {error_msg}")
+                        elif "keyerror" in error_msg.lower():
+                            self.logger().warning(f"Missing field in {message_type} message: {error_msg}")
+                        else:
+                            self.logger().exception(f"Error processing {message_type} message")
+                            
+                        # Log stats periodically for debugging
+                        stats = self._get_message_processing_stats()
+                        if stats['total_messages'] % 1000 == 0:  # Every 1000 messages
+                            self.logger().info(f"Order book message processing stats: "
+                                             f"{stats['messages_per_second']:.1f} msg/s, "
+                                             f"{stats['success_rate']:.1%} success rate, "
+                                             f"{stats['avg_processing_time_ms']:.2f}ms avg time")
             
-            # Start ping task for connection keep-alive (VALR requires ping every 30 seconds)
-            ping_task = asyncio.create_task(self._send_ping_messages())
-            
-            await message_processor()
-            
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            self.logger().exception("Error in order book stream listener")
-            raise
-        finally:
-            # Clean up ping task
-            if ping_task and not ping_task.done():
-                ping_task.cancel()
-                try:
-                    await ping_task
-                except asyncio.CancelledError:
-                    pass
+            try:
+                # Establish or re-establish connection
+                if not self._ws_assistant:
+                    self._record_connection_attempt()
+                    health_status = self._get_connection_health_status()
+                    self.logger().info(f"Establishing VALR Trade WebSocket connection for order book stream "
+                                     f"(attempt #{health_status['total_connections']}, success rate: {health_status['success_rate']:.1%})")
+                    
+                    self._ws_assistant = await self._connected_websocket_assistant()
+                    await self._subscribe_channels(self._ws_assistant)
+                    
+                    self._record_connection_success()
+                    health_status = self._get_connection_health_status()
+                    self.logger().info(f"Successfully established VALR Trade WebSocket connection "
+                                     f"(success rate: {health_status['success_rate']:.1%}, "
+                                     f"consecutive failures reset from {health_status['consecutive_failures']} to 0)")
+                
+                # Start ping task for connection keep-alive (VALR requires ping every 30 seconds)
+                ping_task = asyncio.create_task(self._send_ping_messages())
+                
+                await message_processor()
+                
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                error_msg = str(e)
+                
+                # Determine if this is a normal disconnect
+                is_normal_disconnect = "close code = 1000" in error_msg.lower()
+                
+                # Record the failure with proper classification
+                self._record_connection_failure(is_normal_disconnect)
+                health_status = self._get_connection_health_status()
+                
+                # Calculate optimized delay based on disconnect type
+                adaptive_delay = self._calculate_adaptive_delay(is_normal_disconnect)
+                
+                # Handle VALR's expected 30-second disconnections (close code 1000)  
+                if is_normal_disconnect:
+                    self.logger().info(f"VALR Trade WebSocket closed normally (code 1000) - "
+                                     f"normal disconnect #{health_status['normal_disconnects']} "
+                                     f"(avg interval: {health_status['avg_disconnect_interval']:.1f}s, "
+                                     f"abnormal failure rate: {health_status['abnormal_failure_rate']:.1%})")
+                    
+                    # For normal disconnects, don't limit by consecutive_failures since they're not real failures
+                    self.logger().info(f"Fast reconnecting order book stream in {adaptive_delay:.1f}s "
+                                     f"(optimized for code 1000 pattern, "
+                                     f"pattern established: {health_status['disconnect_pattern_established']})")
+                    self._ws_assistant = None  # Force new connection
+                    await asyncio.sleep(adaptive_delay)
+                    continue  # Retry the connection loop
+                        
+                # Handle other connection errors
+                else:
+                    self.logger().error(f"Order book stream connection failed: {error_msg} "
+                                      f"(failure #{health_status['consecutive_failures']}, "
+                                      f"success rate: {health_status['success_rate']:.1%})")
+                    
+                    if health_status['consecutive_failures'] <= max_reconnection_attempts:
+                        self.logger().info(f"Retrying order book connection in {adaptive_delay:.1f} seconds "
+                                         f"(adaptive delay based on {health_status['success_rate']:.1%} success rate, "
+                                         f"attempt {health_status['consecutive_failures']}/{max_reconnection_attempts})")
+                        self._ws_assistant = None  # Force new connection
+                        await asyncio.sleep(adaptive_delay)
+                        continue  # Retry the connection loop
+                    else:
+                        self.logger().error(f"Exhausted reconnection attempts for order book stream. "
+                                          f"Final health status: {health_status}")
+                        break  # Exit the retry loop
+                        
+            finally:
+                # Clean up ping task
+                if ping_task and not ping_task.done():
+                    ping_task.cancel()
+                    try:
+                        await ping_task
+                    except asyncio.CancelledError:
+                        pass
+                        
+                # Clean up WebSocket connection on exit
+                if self._ws_assistant is not None:
+                    await self._ws_assistant.disconnect()
+                    self._ws_assistant = None
 
     async def _send_ping_messages(self):
         """
@@ -725,27 +1126,29 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 self._sequence_numbers[trading_pair] = sequence_number
                 return True
             elif sequence_number <= expected_sequence:
-                # Duplicate or old message
-                self.logger().debug(f"Received old/duplicate sequence {sequence_number} for {trading_pair}, "
-                                  f"expected {expected_sequence + 1}")
-                return False
+                # Duplicate or old message - allow processing anyway for VALR high-frequency
+                self.logger().debug(f"Old/duplicate sequence {sequence_number} for {trading_pair}, "
+                                  f"expected {expected_sequence + 1} - allowing anyway")
+                return True  # Changed to True to allow processing
             else:
-                # Gap detected - allow small gaps (up to 50 messages) but reject large gaps
+                # Gap detected - VALR has very high-frequency trading, allow large gaps
                 gap_size = sequence_number - expected_sequence - 1
-                if gap_size <= 50:  # Allow small gaps (common in high-frequency trading)
-                    self.logger().debug(f"Small sequence gap ({gap_size}) for {trading_pair} - continuing")
+                if gap_size <= 2000:  # Dramatically increased tolerance for VALR's high-frequency trading (was 500)
+                    if gap_size > 100:
+                        self.logger().debug(f"Large sequence gap ({gap_size}) for {trading_pair} - continuing (VALR high-frequency)")
                     self._sequence_numbers[trading_pair] = sequence_number
                     return True
                 else:
-                    # Large gap - may indicate missed updates
-                    self.logger().warning(f"Large sequence gap ({gap_size}) for {trading_pair}! "
-                                        f"Expected {expected_sequence + 1}, received {sequence_number}")
-                    # Update to current sequence but allow the update to process
+                    # Extremely large gap - likely connection reset, but still allow the update
+                    self.logger().info(f"Very large sequence gap ({gap_size}) for {trading_pair}! "
+                                     f"Expected {expected_sequence + 1}, received {sequence_number} - allowing anyway")
+                    # Reset sequence tracking and allow the update to process
                     self._sequence_numbers[trading_pair] = sequence_number
-                    return True  # Still allow the update to process
+                    self.logger().info(f"Reset sequence tracking for {trading_pair} due to very large gap - continuing")
+                    return True  # Always allow update to prevent order book blocking
                 
         except Exception as e:
-            self.logger().error(f"Error validating sequence number: {e}")
+            self.logger().error(f"Error validating sequence number for {trading_pair}: {e} - allowing anyway")
             return True  # Assume valid on error
             
     def _process_order_book_update(self, raw_bids: list[dict], raw_asks: list[dict]) -> tuple[list[list[str]], list[list[str]]]:

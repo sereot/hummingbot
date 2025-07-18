@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from hummingbot.connector.exchange.valr import valr_constants as CONSTANTS, valr_web_utils as web_utils
 from hummingbot.connector.exchange.valr.valr_auth import ValrAuth
@@ -36,6 +36,24 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._domain = domain
         self._last_recv_time: float = 0  # Track last received time for REST fallback mode
         self._ws_assistant: WSAssistant | None = None  # Store WebSocket assistant reference
+        
+        # Connection health monitoring
+        self._connection_health = {
+            'total_connections': 0,
+            'successful_connections': 0,
+            'failed_connections': 0,
+            'consecutive_failures': 0,
+            'last_success_time': 0,
+            'last_failure_time': 0,
+            'circuit_breaker_active': False,
+            'circuit_breaker_activated_time': 0,
+            'average_uptime': 0,
+            'connection_start_time': 0,
+            'normal_disconnects': 0,  # Count of code 1000 disconnects
+            'abnormal_disconnects': 0,  # Count of other disconnects
+            'total_uptime': 0,  # Total connection uptime
+            'disconnect_pattern': []  # Track disconnect intervals for pattern analysis
+        }
     
     @property
     def last_recv_time(self) -> float:
@@ -49,6 +67,156 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
         if self._ws_assistant:
             return max(self._last_recv_time, self._ws_assistant.last_recv_time)
         return self._last_recv_time
+
+    def _record_connection_attempt(self):
+        """Record a new connection attempt for health monitoring."""
+        self._connection_health['total_connections'] += 1
+        self._connection_health['connection_start_time'] = time.time()
+
+    def _record_connection_success(self):
+        """Record a successful connection for health monitoring."""
+        self._connection_health['successful_connections'] += 1
+        self._connection_health['consecutive_failures'] = 0
+        self._connection_health['last_success_time'] = time.time()
+        self._connection_health['circuit_breaker_active'] = False
+        
+        # Calculate average uptime
+        if self._connection_health['successful_connections'] > 0:
+            total_uptime = self._connection_health['last_success_time'] - self._connection_health.get('first_success_time', self._connection_health['last_success_time'])
+            self._connection_health['average_uptime'] = total_uptime / self._connection_health['successful_connections']
+        
+        # Set first success time if not already set
+        if 'first_success_time' not in self._connection_health:
+            self._connection_health['first_success_time'] = self._connection_health['last_success_time']
+
+    def _record_connection_failure(self, is_normal_disconnect: bool = False):
+        """Record a connection failure for health monitoring."""
+        self._connection_health['failed_connections'] += 1
+        self._connection_health['last_failure_time'] = time.time()
+        
+        # Record uptime if we had a successful connection
+        if self._connection_health['connection_start_time'] > 0:
+            uptime = time.time() - self._connection_health['connection_start_time']
+            self._connection_health['total_uptime'] += uptime
+            
+            # Track disconnect intervals for pattern analysis (keep last 10)
+            if len(self._connection_health['disconnect_pattern']) >= 10:
+                self._connection_health['disconnect_pattern'].pop(0)
+            self._connection_health['disconnect_pattern'].append(uptime)
+        
+        if is_normal_disconnect:
+            # VALR's expected 30-second disconnects - don't count as real failures
+            self._connection_health['normal_disconnects'] += 1
+            # Don't increment consecutive_failures for normal disconnects
+            self.logger().debug(f"Normal disconnect recorded (code 1000). "
+                              f"Total normal: {self._connection_health['normal_disconnects']}, "
+                              f"abnormal: {self._connection_health['abnormal_disconnects']}")
+        else:
+            # Abnormal disconnects - count towards consecutive failures
+            self._connection_health['abnormal_disconnects'] += 1
+            self._connection_health['consecutive_failures'] += 1
+            
+            # Activate circuit breaker if consecutive failures exceed threshold
+            if self._connection_health['consecutive_failures'] >= CONSTANTS.CONNECTION_FAILURE_THRESHOLD:
+                self._connection_health['circuit_breaker_active'] = True
+                self._connection_health['circuit_breaker_activated_time'] = time.time()
+                self.logger().warning(f"User stream connection circuit breaker activated after "
+                                    f"{self._connection_health['consecutive_failures']} consecutive abnormal failures")
+
+    def _should_attempt_connection(self) -> bool:
+        """Check if connection should be attempted based on circuit breaker state."""
+        if not self._connection_health['circuit_breaker_active']:
+            return True
+        
+        # Check if recovery time has passed
+        time_since_activation = time.time() - self._connection_health['circuit_breaker_activated_time']
+        if time_since_activation >= CONSTANTS.CONNECTION_RECOVERY_TIME:
+            self.logger().info(f"User stream connection circuit breaker recovery time elapsed, allowing connection attempt")
+            return True
+        
+        return False
+
+    def _calculate_adaptive_delay(self, is_normal_disconnect: bool = False) -> float:
+        """Calculate adaptive reconnection delay based on connection health."""
+        if is_normal_disconnect:
+            # Optimized delay for VALR's normal 30-second disconnects
+            return self._calculate_normal_disconnect_delay()
+        
+        failures = self._connection_health['consecutive_failures']
+        
+        # Base exponential backoff for abnormal disconnects
+        base_delay = min(CONSTANTS.ADAPTIVE_DELAY_MIN * (2 ** failures), CONSTANTS.ADAPTIVE_DELAY_MAX)
+        
+        # Adjust based on success rate
+        total_attempts = self._connection_health['total_connections']
+        if total_attempts > 0:
+            # Only consider abnormal disconnects for success rate calculation
+            abnormal_failures = self._connection_health['abnormal_disconnects']
+            abnormal_success_rate = max(0, (total_attempts - abnormal_failures) / total_attempts)
+            
+            # Lower success rate = longer delays
+            if abnormal_success_rate < 0.3:
+                base_delay *= 2.0  # Double delay for very poor success rate
+            elif abnormal_success_rate < 0.6:
+                base_delay *= 1.5  # Increase delay for poor success rate
+        
+        return min(base_delay, CONSTANTS.ADAPTIVE_DELAY_MAX)
+    
+    def _calculate_normal_disconnect_delay(self) -> float:
+        """Calculate optimized delay for VALR's normal code 1000 disconnects."""
+        # Analyze disconnect pattern to predict optimal reconnection timing
+        if len(self._connection_health['disconnect_pattern']) >= 3:
+            # Calculate average connection duration
+            avg_uptime = sum(self._connection_health['disconnect_pattern']) / len(self._connection_health['disconnect_pattern'])
+            
+            # If connections typically last around 30 seconds, use minimal delay
+            if 25 <= avg_uptime <= 35:
+                return 0.5  # Very fast reconnect for predictable pattern
+            elif 20 <= avg_uptime <= 40:
+                return 1.0  # Fast reconnect for near-predictable pattern
+        
+        # Default optimized delay for normal disconnects
+        normal_disconnects = self._connection_health['normal_disconnects']
+        if normal_disconnects > 10:
+            # We've seen many normal disconnects, use very fast reconnect
+            return 0.5
+        elif normal_disconnects > 5:
+            # Moderate normal disconnect history, use fast reconnect
+            return 1.0
+        else:
+            # Haven't established pattern yet, use slightly longer delay
+            return 2.0
+
+    def _get_connection_health_status(self) -> dict[str, Any]:
+        """Get current connection health metrics."""
+        total_attempts = self._connection_health['total_connections']
+        success_rate = (self._connection_health['successful_connections'] / total_attempts) if total_attempts > 0 else 0
+        
+        # Calculate abnormal failure rate (excluding normal disconnects)
+        abnormal_failures = self._connection_health['abnormal_disconnects']
+        abnormal_failure_rate = (abnormal_failures / total_attempts) if total_attempts > 0 else 0
+        
+        # Calculate average disconnect interval
+        avg_disconnect_interval = 0
+        if len(self._connection_health['disconnect_pattern']) > 0:
+            avg_disconnect_interval = sum(self._connection_health['disconnect_pattern']) / len(self._connection_health['disconnect_pattern'])
+        
+        return {
+            'total_connections': total_attempts,
+            'successful_connections': self._connection_health['successful_connections'],
+            'failed_connections': self._connection_health['failed_connections'],
+            'consecutive_failures': self._connection_health['consecutive_failures'],
+            'success_rate': success_rate,
+            'circuit_breaker_active': self._connection_health['circuit_breaker_active'],
+            'average_uptime': self._connection_health['average_uptime'],
+            'last_success_time': self._connection_health['last_success_time'],
+            'last_failure_time': self._connection_health['last_failure_time'],
+            'normal_disconnects': self._connection_health['normal_disconnects'],
+            'abnormal_disconnects': self._connection_health['abnormal_disconnects'],
+            'abnormal_failure_rate': abnormal_failure_rate,
+            'avg_disconnect_interval': avg_disconnect_interval,
+            'disconnect_pattern_established': len(self._connection_health['disconnect_pattern']) >= 3
+        }
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """
@@ -139,62 +307,126 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
     async def listen_for_user_stream(self, output: asyncio.Queue):
         """
         Continuously listens to user stream events and places them in the output queue.
-        Includes ping-pong mechanism to maintain connection as per VALR API requirements.
+        Includes robust reconnection handling for VALR's 30-second disconnect pattern.
         
         Args:
             output: The queue to place received messages
         """
-        websocket_assistant = None
-        ping_task = None
+        max_reconnection_attempts = 3
         
-        try:
-            self.logger().info("Attempting to establish VALR WebSocket user stream connection")
-            websocket_assistant = await self._connected_websocket_assistant()
-            self._ws_assistant = websocket_assistant  # Store the WebSocket assistant
-            self.logger().info("Successfully established VALR WebSocket user stream connection")
+        while True:
+            websocket_assistant = None
+            ping_task = None
             
-            # Subscribe to user stream channels
-            await self._subscribe_channels(websocket_assistant)
+            # Check circuit breaker before attempting connection
+            if not self._should_attempt_connection():
+                health_status = self._get_connection_health_status()
+                time_remaining = CONSTANTS.CONNECTION_RECOVERY_TIME - (time.time() - self._connection_health['circuit_breaker_activated_time'])
+                self.logger().warning(f"User stream connection circuit breaker active. Recovery in {time_remaining:.1f}s. "
+                                    f"Health: {health_status['success_rate']:.2%} success rate, "
+                                    f"{health_status['consecutive_failures']} consecutive failures")
+                await asyncio.sleep(30)  # Wait before checking again
+                continue
             
-            # Start ping task for connection keep-alive (VALR requires ping every 30 seconds)
-            ping_task = asyncio.create_task(self._send_ping_messages(websocket_assistant))
-            
-            # Main message listening loop
-            async for ws_response in websocket_assistant.iter_messages():
-                event_message = ws_response.data
+            try:
+                self._record_connection_attempt()
+                health_status = self._get_connection_health_status()
+                self.logger().info(f"Attempting to establish VALR WebSocket user stream connection "
+                                 f"(attempt #{health_status['total_connections']}, success rate: {health_status['success_rate']:.1%})")
                 
-                # Handle ping/pong messages
-                if isinstance(event_message, str):
-                    if event_message.upper() == "PONG":
-                        self.logger().debug("Received PONG response from VALR")
-                        continue
-                    elif event_message.upper() == "PING":
-                        # Send PONG response
-                        await websocket_assistant.send(WSJSONRequest({"type": "PONG"}))
-                        self.logger().debug("Sent PONG response to VALR")
-                        continue
+                websocket_assistant = await self._connected_websocket_assistant()
+                self._ws_assistant = websocket_assistant  # Store the WebSocket assistant
                 
-                # Log received messages for debugging
-                self.logger().debug(f"Received user stream message: {event_message}")
+                self._record_connection_success()
+                health_status = self._get_connection_health_status()
+                self.logger().info(f"Successfully established VALR WebSocket user stream connection "
+                                 f"(success rate: {health_status['success_rate']:.1%}, "
+                                 f"consecutive failures reset from {health_status['consecutive_failures']} to 0)")
                 
-                # Place the message in the output queue
-                output.put_nowait(event_message)
+                # Subscribe to user stream channels
+                await self._subscribe_channels(websocket_assistant)
                 
-        except asyncio.CancelledError:
-            self.logger().info("User stream listener cancelled - shutting down gracefully")
-            raise
-        except Exception as e:
-            error_msg = str(e)
-            self.logger().error(f"Error in user stream connection: {error_msg}")
-            
-            # Check if it's a permission/authentication error
-            if any(keyword in error_msg.lower() for keyword in ["unauthorized", "forbidden", "permission", "401", "403"]):
-                self.logger().warning("VALR WebSocket user stream authentication failed - API key may not have WebSocket permissions")
-                self.logger().warning("Falling back to REST API polling for account updates")
+                # Start ping task for connection keep-alive (VALR requires ping every 30 seconds)
+                ping_task = asyncio.create_task(self._send_ping_messages(websocket_assistant))
                 
-                # Fall back to REST-only mode by keeping the method running 
-                # Update last_recv_time periodically to indicate user stream is "active"
-                # This allows the connector to become ready even in REST-only mode
+                # Main message listening loop
+                async for ws_response in websocket_assistant.iter_messages():
+                    event_message = ws_response.data
+                    
+                    # Handle ping/pong messages
+                    if isinstance(event_message, str):
+                        if event_message.upper() == "PONG":
+                            self.logger().debug("Received PONG response from VALR")
+                            continue
+                        elif event_message.upper() == "PING":
+                            # Send PONG response
+                            await websocket_assistant.send(WSJSONRequest({"type": "PONG"}))
+                            self.logger().debug("Sent PONG response to VALR")
+                            continue
+                    
+                    # Log received messages for debugging
+                    self.logger().debug(f"Received user stream message: {event_message}")
+                    
+                    # Place the message in the output queue
+                    output.put_nowait(event_message)
+                    
+            except asyncio.CancelledError:
+                self.logger().info("User stream listener cancelled - shutting down gracefully")
+                raise
+            except Exception as e:
+                error_msg = str(e)
+                
+                # Determine if this is a normal disconnect
+                is_normal_disconnect = "close code = 1000" in error_msg.lower()
+                
+                # Record the failure with proper classification
+                self._record_connection_failure(is_normal_disconnect)
+                health_status = self._get_connection_health_status()
+                
+                # Calculate optimized delay based on disconnect type
+                adaptive_delay = self._calculate_adaptive_delay(is_normal_disconnect)
+                
+                # Handle VALR's expected 30-second disconnections (close code 1000)
+                if is_normal_disconnect:
+                    self.logger().info(f"VALR WebSocket closed normally (code 1000) - "
+                                     f"normal disconnect #{health_status['normal_disconnects']} "
+                                     f"(avg interval: {health_status['avg_disconnect_interval']:.1f}s, "
+                                     f"abnormal failure rate: {health_status['abnormal_failure_rate']:.1%})")
+                    
+                    # For normal disconnects, don't limit by consecutive_failures since they're not real failures
+                    self.logger().info(f"Fast reconnecting user stream in {adaptive_delay:.1f}s "
+                                     f"(optimized for code 1000 pattern, "
+                                     f"pattern established: {health_status['disconnect_pattern_established']})")
+                    await asyncio.sleep(adaptive_delay)
+                    continue  # Retry the connection loop
+                
+                # Handle authentication and permission errors
+                elif any(keyword in error_msg.lower() for keyword in ["unauthorized", "forbidden", "permission", "401", "403"]):
+                    self.logger().warning(f"VALR WebSocket user stream authentication failed - API key may not have WebSocket permissions "
+                                        f"(failure #{health_status['consecutive_failures']}, success rate: {health_status['success_rate']:.1%})")
+                    self.logger().warning("Falling back to REST API polling for account updates")
+                
+                # Handle rate limiting errors
+                elif any(keyword in error_msg.lower() for keyword in ["rate limit", "429", "too many requests"]):
+                    self.logger().warning(f"User stream rate limited "
+                                        f"(failure #{health_status['consecutive_failures']}, success rate: {health_status['success_rate']:.1%}). "
+                                        f"Falling back to REST mode.")
+                
+                # Handle other connection errors
+                else:
+                    self.logger().error(f"User stream connection failed: {error_msg} "
+                                      f"(failure #{health_status['consecutive_failures']}, "
+                                      f"success rate: {health_status['success_rate']:.1%})")
+                    
+                    if health_status['consecutive_failures'] <= max_reconnection_attempts:
+                        self.logger().info(f"Retrying user stream connection in {adaptive_delay:.1f} seconds "
+                                         f"(adaptive delay based on {health_status['success_rate']:.1%} success rate, "
+                                         f"attempt {health_status['consecutive_failures']}/{max_reconnection_attempts})")
+                        await asyncio.sleep(adaptive_delay)
+                        continue  # Retry the connection loop
+                
+                # Fall back to REST-only mode after exhausting reconnection attempts
+                self.logger().info("Exhausted reconnection attempts. Operating in REST-only mode for user stream.")
                 try:
                     while True:
                         # Update last_recv_time to simulate active user stream
@@ -203,23 +435,20 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 except asyncio.CancelledError:
                     self.logger().info("User stream listener cancelled during REST fallback - shutting down gracefully")
                     raise
-            else:
-                # For other errors, attempt reconnection
-                self.logger().error(f"User stream connection failed: {error_msg}")
-                raise
-        finally:
-            # Clean up ping task
-            if ping_task and not ping_task.done():
-                ping_task.cancel()
-                try:
-                    await ping_task
-                except asyncio.CancelledError:
-                    pass
-            
-            # Clean up WebSocket connection
-            if websocket_assistant is not None:
-                await websocket_assistant.disconnect()
-                self._ws_assistant = None  # Clear the reference
+                    
+            finally:
+                # Clean up ping task
+                if ping_task and not ping_task.done():
+                    ping_task.cancel()
+                    try:
+                        await ping_task
+                    except asyncio.CancelledError:
+                        pass
+                
+                # Clean up WebSocket connection
+                if websocket_assistant is not None:
+                    await websocket_assistant.disconnect()
+                    self._ws_assistant = None  # Clear the reference
 
     async def _send_ping_messages(self, websocket_assistant):
         """

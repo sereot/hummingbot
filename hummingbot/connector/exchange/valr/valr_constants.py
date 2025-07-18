@@ -68,6 +68,16 @@ MESSAGE_TIMEOUT = 30.0
 PING_TIMEOUT = 10.0
 API_CALL_TIMEOUT = 10.0
 API_MAX_RETRIES = 4
+READY_STATE_TIMEOUT = 60.0  # Maximum time to wait for connector to reach ready state
+SYMBOL_MAPPING_TIMEOUT = 30.0  # Maximum time to wait for symbol mapping initialization
+
+# Connection Health Monitoring
+CONNECTION_HEALTH_CHECK_INTERVAL = 60.0  # Check connection health every 60 seconds
+CONNECTION_SUCCESS_THRESHOLD = 3  # Number of successful connections to consider healthy
+CONNECTION_FAILURE_THRESHOLD = 5  # Number of consecutive failures before circuit breaker
+CONNECTION_RECOVERY_TIME = 300.0  # Time to wait before attempting recovery from circuit breaker
+ADAPTIVE_DELAY_MAX = 60.0  # Maximum adaptive reconnection delay
+ADAPTIVE_DELAY_MIN = 1.0  # Minimum adaptive reconnection delay
 
 # Intervals
 ONE_HOUR = 60 * 60
