@@ -423,10 +423,10 @@ class ValrTestBot(ScriptStrategyBase):
                                 
                                 cancellation_successful = False
                         
-                        # Wait a moment for cancellations to process
+                        # Wait longer for VALR exchange to process cancellations
                         import time
-                        self.log_with_clock(logging.DEBUG, "⏳ Waiting 2s for cancellations to process...")
-                        time.sleep(2)
+                        self.log_with_clock(logging.DEBUG, "⏳ Waiting 5s for VALR cancellations to process...")
+                        time.sleep(5)
                         
                         # CRITICAL: Validate cancellation via REST API
                         cancelled_order_ids = []
@@ -442,9 +442,9 @@ class ValrTestBot(ScriptStrategyBase):
                             if order_id:
                                 cancelled_order_ids.append(order_id)
                         
-                        # Validate that orders were actually cancelled
+                        # Validate that orders were actually cancelled using progressive validation
                         if cancelled_order_ids:
-                            validation_successful = self._validate_cancellation_via_rest(self.config.exchange, cancelled_order_ids)
+                            validation_successful = self._progressive_validation(self.config.exchange, cancelled_order_ids)
                             
                             if not validation_successful:
                                 self.log_with_clock(logging.ERROR, f"❌ Cancellation validation failed - orders still exist on exchange")
@@ -1100,14 +1100,23 @@ class ValrTestBot(ScriptStrategyBase):
                     return True
                     
             else:
-                # Fallback: check if the connector's internal tracking shows fewer orders
+                # Fallback: check if the connector's internal tracking shows the specific orders are gone
                 current_orders = self.get_connector_active_orders(connector_name)
-                if len(current_orders) == 0:
-                    self.log_with_clock(logging.INFO, f"✅ Connector validation passed: No active orders found")
-                    return True
-                else:
-                    self.log_with_clock(logging.WARNING, f"⚠️ Connector validation: {len(current_orders)} orders still active")
+                
+                # Check if any of the specific cancelled orders are still in current orders
+                still_open = []
+                for order_id in order_ids:
+                    for current_order in current_orders:
+                        if (hasattr(current_order, 'client_order_id') and current_order.client_order_id == order_id) or \
+                           (hasattr(current_order, 'exchange_order_id') and current_order.exchange_order_id == order_id):
+                            still_open.append(order_id)
+                
+                if still_open:
+                    self.log_with_clock(logging.WARNING, f"⚠️ Connector validation failed: {len(still_open)} specific orders still active: {still_open}")
                     return False
+                else:
+                    self.log_with_clock(logging.INFO, f"✅ Connector validation passed: All {len(order_ids)} specific orders cancelled")
+                    return True
                     
         except Exception as e:
             self.log_with_clock(logging.ERROR, f"❌ Error validating cancellation via REST: {e}")
@@ -1154,12 +1163,37 @@ class ValrTestBot(ScriptStrategyBase):
                         self.log_with_clock(logging.ERROR, f"❌ Retry failed for order {order_id}: {e}")
                         still_failed.append(order)
                 
-                # Check if retries worked
+                # Validate that the retries actually worked by checking if orders are gone
                 if not still_failed:
-                    self.log_with_clock(logging.INFO, f"✅ All retries successful after {retry + 1} attempts")
-                    return True
+                    # Get the order IDs that we attempted to cancel
+                    attempted_order_ids = []
+                    for order in failed_orders:
+                        if hasattr(order, 'client_order_id') and order.client_order_id:
+                            attempted_order_ids.append(order.client_order_id)
+                        elif hasattr(order, 'exchange_order_id') and order.exchange_order_id:
+                            attempted_order_ids.append(order.exchange_order_id)
+                        elif isinstance(order, dict):
+                            order_id = order.get('client_order_id')
+                            if order_id:
+                                attempted_order_ids.append(order_id)
                     
-                failed_orders = still_failed
+                    if attempted_order_ids:
+                        # Wait longer for VALR to process
+                        import time
+                        time.sleep(3)
+                        
+                        # Validate via REST API
+                        if self._validate_cancellation_via_rest(connector_name, attempted_order_ids):
+                            self.log_with_clock(logging.INFO, f"✅ All retries successful after {retry + 1} attempts - validated via REST")
+                            return True
+                        else:
+                            self.log_with_clock(logging.WARNING, f"⚠️ Retry attempt {retry + 1} failed validation - orders still exist")
+                            failed_orders = still_failed
+                    else:
+                        self.log_with_clock(logging.INFO, f"✅ All retries successful after {retry + 1} attempts")
+                        return True
+                else:
+                    failed_orders = still_failed
                 
                 # Wait before next retry
                 if retry < max_retries - 1:
@@ -1172,6 +1206,36 @@ class ValrTestBot(ScriptStrategyBase):
             
         except Exception as e:
             self.log_with_clock(logging.ERROR, f"❌ Error during retry cancellation: {e}")
+            return False
+
+    def _progressive_validation(self, connector_name: str, order_ids: List[str], max_attempts: int = 3) -> bool:
+        """
+        Progressive validation with exponential backoff to handle VALR's processing delays.
+        """
+        try:
+            delays = [2, 5, 10]  # Progressive delays: 2s, 5s, 10s
+            
+            for attempt in range(max_attempts):
+                delay = delays[attempt] if attempt < len(delays) else 10
+                
+                self.log_with_clock(logging.DEBUG, f"🔍 Progressive validation attempt {attempt + 1}/{max_attempts} (waiting {delay}s)")
+                
+                import time
+                time.sleep(delay)
+                
+                # Validate cancellation
+                if self._validate_cancellation_via_rest(connector_name, order_ids):
+                    self.log_with_clock(logging.INFO, f"✅ Progressive validation successful after {attempt + 1} attempts ({delay}s delay)")
+                    return True
+                else:
+                    self.log_with_clock(logging.WARNING, f"⚠️ Progressive validation attempt {attempt + 1} failed - orders still exist")
+            
+            # All attempts failed
+            self.log_with_clock(logging.ERROR, f"❌ Progressive validation failed after {max_attempts} attempts")
+            return False
+            
+        except Exception as e:
+            self.log_with_clock(logging.ERROR, f"❌ Error during progressive validation: {e}")
             return False
 
     def track_placed_order(self, order_side: str, amount: Decimal, price: Decimal, client_order_id: str = None):
