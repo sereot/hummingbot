@@ -158,6 +158,16 @@ class ValrExchange(ExchangePyBase):
             if not self.ready and self.trading_pair_symbol_map_ready():
                 self.logger().warning("FAILSAFE: Forcing connector ready state after timeout")
                 
+                # Try to initialize missing components
+                try:
+                    # Initialize trading rules if missing
+                    if not hasattr(self, '_trading_rules') or len(self._trading_rules) == 0:
+                        self.logger().info("FAILSAFE: Attempting to initialize trading rules...")
+                        await self._update_trading_rules()
+                        self.logger().info(f"FAILSAFE: Trading rules initialized with {len(self._trading_rules)} rules")
+                except Exception as e:
+                    self.logger().warning(f"FAILSAFE: Could not initialize trading rules: {e}")
+                
                 # Log current ready state components for debugging
                 ready_status = {
                     'symbols_mapping_initialized': self.trading_pair_symbol_map_ready(),
@@ -331,6 +341,17 @@ class ValrExchange(ExchangePyBase):
         
         # This should never be reached, but just in case
         raise Exception("Unexpected exit from trading pairs request retry loop")
+
+    async def _make_trading_rules_request(self) -> Any:
+        """
+        Make request to get trading rules (same as trading pairs for VALR).
+        VALR trading rules come from the same endpoint as trading pairs.
+        
+        Returns:
+            Exchange info with trading rules data
+        """
+        # For VALR, trading rules come from the same endpoint as trading pairs
+        return await self._make_trading_pairs_request()
 
     def _create_web_assistants_factory(self) -> WebAssistantsFactory:
         return web_utils.build_api_factory(
