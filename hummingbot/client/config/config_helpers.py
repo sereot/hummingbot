@@ -578,6 +578,18 @@ def get_strategy_starter_file(strategy: str) -> Callable:
     if strategy is None:
         return lambda: None
     try:
+        # Clear import cache for strategy modules to prevent cache pollution issues
+        import sys
+        modules_to_clear = [
+            f"hummingbot.strategy.{strategy}.start",
+            f"hummingbot.strategy.{strategy}",
+            "hummingbot.strategy.api_asset_price_delegate",
+            "hummingbot.connector.connector_base"
+        ]
+        for module in modules_to_clear:
+            if module in sys.modules:
+                del sys.modules[module]
+        
         strategy_module = __import__(f"hummingbot.strategy.{strategy}.start",
                                      fromlist=[f"hummingbot.strategy.{strategy}"])
         return getattr(strategy_module, "start")

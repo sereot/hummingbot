@@ -169,23 +169,23 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
             # Calculate average connection duration
             avg_uptime = sum(self._connection_health['disconnect_pattern']) / len(self._connection_health['disconnect_pattern'])
             
-            # If connections typically last around 30 seconds, use minimal delay
+            # If connections typically last around 30 seconds, use ultra-fast reconnect for HFT
             if 25 <= avg_uptime <= 35:
-                return 0.5  # Very fast reconnect for predictable pattern
+                return 0.1  # Ultra-fast reconnect for HFT market making
             elif 20 <= avg_uptime <= 40:
-                return 1.0  # Fast reconnect for near-predictable pattern
+                return 0.2  # Very fast reconnect for near-predictable pattern
         
         # Default optimized delay for normal disconnects
         normal_disconnects = self._connection_health['normal_disconnects']
         if normal_disconnects > 10:
-            # We've seen many normal disconnects, use very fast reconnect
-            return 0.5
+            # We've seen many normal disconnects, use ultra-fast reconnect for HFT
+            return 0.1
         elif normal_disconnects > 5:
-            # Moderate normal disconnect history, use fast reconnect
-            return 1.0
+            # Moderate normal disconnect history, use very fast reconnect
+            return 0.2
         else:
-            # Haven't established pattern yet, use slightly longer delay
-            return 2.0
+            # Haven't established pattern yet, use fast but safe delay
+            return 0.5
 
     def _get_connection_health_status(self) -> dict[str, Any]:
         """Get current connection health metrics."""

@@ -1236,13 +1236,20 @@ cdef class PureMarketMakingStrategy(StrategyBase):
                 self.c_cancel_order(self._market_info, order.client_order_id)
 
     cdef bint c_to_create_orders(self, object proposal):
+        # Early exit conditions for better performance
+        if (self._create_timestamp >= self._current_timestamp or 
+            proposal is None):
+            return False
+            
+        # Check order cancellation confirmation requirement
+        if (self._should_wait_order_cancel_confirmation and 
+            len(self._sb_order_tracker.in_flight_cancels) > 0):
+            return False
+            
+        # Check for existing non-hanging, non-cancelled orders
         non_hanging_orders_non_cancelled = [o for o in self.active_non_hanging_orders if not
                                             self._hanging_orders_tracker.is_potential_hanging_order(o)]
-        return (self._create_timestamp < self._current_timestamp
-                and (not self._should_wait_order_cancel_confirmation or
-                     len(self._sb_order_tracker.in_flight_cancels) == 0)
-                and proposal is not None
-                and len(non_hanging_orders_non_cancelled) == 0)
+        return len(non_hanging_orders_non_cancelled) == 0
 
     cdef c_execute_orders_proposal(self, object proposal):
         cdef:
@@ -1305,7 +1312,9 @@ cdef class PureMarketMakingStrategy(StrategyBase):
         if self._create_timestamp <= self._current_timestamp:
             self._create_timestamp = next_cycle
         if self._cancel_timestamp <= self._current_timestamp:
-            self._cancel_timestamp = min(self._create_timestamp, next_cycle)
+            # Set cancel timestamp to be just before the next create cycle to allow orders to exist
+            # Subtract 0.1 seconds to ensure cancellation happens before the next creation
+            self._cancel_timestamp = max(next_cycle - 0.1, self._current_timestamp + 0.05)
 
     def notify_hb_app(self, msg: str):
         if self._hb_app_notification:

@@ -53,7 +53,7 @@ class ValrExchange(ExchangePyBase):
         
         # WebSocket order placement tracking
         self._ws_order_requests: dict[str, asyncio.Future] = {}  # clientMsgId -> Future
-        self._ws_order_placement_enabled = False
+        self._ws_order_placement_enabled = True  # Enable by default for HFT performance
         
         # Ready state tracking for VALR-specific behavior
         self._ready_state_override = False
@@ -555,8 +555,8 @@ class ValrExchange(ExchangePyBase):
             await ws_assistant.send(order_message)
             self.logger().debug(f"Sent WebSocket order placement: {client_msg_id}")
             
-            # Wait for response with timeout
-            response = await asyncio.wait_for(response_future, timeout=30.0)
+            # Wait for response with timeout (optimized for HFT)
+            response = await asyncio.wait_for(response_future, timeout=5.0)
             
             # Extract order ID from response
             if response.get("type") == CONSTANTS.WS_ORDER_RESPONSE_EVENT:
@@ -672,8 +672,8 @@ class ValrExchange(ExchangePyBase):
             await ws_assistant.send(cancel_message)
             self.logger().debug(f"Sent WebSocket order cancellation: {client_msg_id}")
             
-            # Wait for response with timeout
-            response = await asyncio.wait_for(response_future, timeout=30.0)
+            # Wait for response with timeout (optimized for HFT)
+            response = await asyncio.wait_for(response_future, timeout=3.0)
             
             # Check if cancellation was successful
             if response.get("type") == CONSTANTS.WS_USER_ORDER_CANCEL_EVENT:

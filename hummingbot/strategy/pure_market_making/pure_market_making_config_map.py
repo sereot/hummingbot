@@ -29,8 +29,11 @@ def validate_exchange_trading_pair(value: str) -> Optional[str]:
 
 def order_amount_prompt() -> str:
     trading_pair = pure_market_making_config_map["market"].value
-    base_asset, quote_asset = trading_pair.split("-")
-    return f"What is the amount of {base_asset} per order? >>> "
+    if trading_pair and "-" in trading_pair:
+        base_asset, quote_asset = trading_pair.split("-")
+        return f"What is the amount of {base_asset} per order? >>> "
+    else:
+        return "What is the amount per order? >>> "
 
 
 def validate_price_source(value: str) -> Optional[str]:
