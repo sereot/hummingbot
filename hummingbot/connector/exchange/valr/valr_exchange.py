@@ -627,7 +627,10 @@ class ValrExchange(ExchangePyBase):
             
             user_stream_data_source = self._user_stream_tracker.data_source
             if not hasattr(user_stream_data_source, '_ws_assistant') or not user_stream_data_source._ws_assistant:
-                raise Exception("WebSocket assistant not available for order placement")
+                # Wait a bit for WebSocket to be ready
+                await asyncio.sleep(0.5)
+                if not hasattr(user_stream_data_source, '_ws_assistant') or not user_stream_data_source._ws_assistant:
+                    raise Exception("WebSocket assistant not available for order placement")
             
             ws_assistant = user_stream_data_source._ws_assistant
             
@@ -771,7 +774,10 @@ class ValrExchange(ExchangePyBase):
         
         user_stream_data_source = self._user_stream_tracker.data_source
         if not hasattr(user_stream_data_source, '_ws_assistant') or not user_stream_data_source._ws_assistant:
-            raise Exception("WebSocket assistant not available for order cancellation")
+            # Wait a bit for WebSocket to be ready
+            await asyncio.sleep(0.5)
+            if not hasattr(user_stream_data_source, '_ws_assistant') or not user_stream_data_source._ws_assistant:
+                raise Exception("WebSocket assistant not available for order cancellation")
         
         ws_assistant = user_stream_data_source._ws_assistant
         

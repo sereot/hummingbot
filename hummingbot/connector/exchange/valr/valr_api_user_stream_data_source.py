@@ -233,21 +233,10 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
         """
         # Use connection pool if enabled
         if self._use_connection_pool:
-            if self._connection_pool is None:
-                # Initialize connection pool
-                self._connection_pool = VALRConnectionPool(
-                    ws_factory=self._api_factory.get_ws_assistant,
-                    ws_url=CONSTANTS.WSS_ACCOUNT_URL,
-                    pool_size=3,
-                    rotation_interval=25.0  # Rotate before VALR's 30s disconnect
-                )
-                await self._connection_pool.initialize()
-                self.logger().info("Initialized connection pool for user stream")
-            
-            # Get connection from pool
-            ws_assistant = await self._connection_pool.get_connection()
-            self.logger().debug("Using pooled connection for user stream")
-            return ws_assistant
+            # Disable connection pooling for now due to authentication issues
+            # Will re-enable once properly tested
+            self.logger().debug("Connection pooling disabled for user stream - using single connection")
+            self._use_connection_pool = False
         
         # Fallback to single connection
         ws_assistant = await self._api_factory.get_ws_assistant()
@@ -374,6 +363,11 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 
                 # Main message listening loop
                 async for ws_response in websocket_assistant.iter_messages():
+                    # Check if we received valid data
+                    if ws_response is None or ws_response.data is None:
+                        self.logger().warning("Received None message from WebSocket, skipping")
+                        continue
+                        
                     event_message = ws_response.data
                     
                     # Handle ping/pong messages

@@ -82,9 +82,9 @@ READY_STATE_TIMEOUT = 60.0  # Maximum time to wait for connector to reach ready 
 SYMBOL_MAPPING_TIMEOUT = 30.0  # Maximum time to wait for symbol mapping initialization
 
 # HFT-specific timeouts
-WS_ORDER_TIMEOUT = 1.0  # Aggressive timeout for WebSocket order placement
-WS_ORDER_MODIFY_TIMEOUT = 1.0  # Timeout for order modifications
-WS_BATCH_ORDER_TIMEOUT = 2.0  # Slightly longer for batch operations
+WS_ORDER_TIMEOUT = 3.0  # Increased for better reliability during initial connection
+WS_ORDER_MODIFY_TIMEOUT = 3.0  # Timeout for order modifications
+WS_BATCH_ORDER_TIMEOUT = 5.0  # Slightly longer for batch operations
 REST_ORDER_TIMEOUT = 5.0  # Fallback REST timeout
 
 # Connection Health Monitoring
