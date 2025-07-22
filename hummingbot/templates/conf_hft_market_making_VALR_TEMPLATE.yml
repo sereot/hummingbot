@@ -1,0 +1,84 @@
+########################################################
+###  HFT Market Making Strategy Configuration for VALR  ###
+########################################################
+
+# Template for high-frequency trading optimized for VALR exchange
+# Achieves <10ms order placement latency with WebSocket integration
+
+template_version: 9
+
+# Exchange and market settings
+exchange: valr_hft  # Use HFT variant for ultra-low latency
+
+# IMPORTANT: Use hyphenated format for VALR pairs (e.g., BTC-ZAR, ETH-USDT)
+market: BTC-ZAR
+
+# HFT-optimized order settings
+bid_spread: 0.0001  # 0.01% - Extremely tight spread for HFT
+ask_spread: 0.0001  # 0.01% - Extremely tight spread for HFT
+
+# Minimum spread to maintain profitability
+minimum_spread: 0.0001
+
+# Order refresh and timing - optimized for HFT
+order_refresh_time: 1.0  # 1 second refresh for rapid market response
+max_order_age: 3.0  # Cancel orders older than 3 seconds
+order_refresh_tolerance_pct: 0.00001  # 0.001% - Very sensitive to price changes
+
+# Order amount settings
+order_amount: 0.0001  # Small order size for HFT (adjust based on pair)
+order_levels: 3  # Multiple levels for better liquidity provision
+order_level_amount: 0.0001  # Amount per level
+order_level_spread: 0.0001  # 0.01% between levels
+
+# Inventory management - critical for HFT
+inventory_skew_enabled: true
+inventory_target_base_pct: 0.5  # Target 50% base inventory
+inventory_range_multiplier: 1.0  # Tighter inventory control
+
+# Price source configuration - use internal order book for lowest latency
+price_source: current_market
+price_type: mid_price
+take_if_crossed: true  # Take crossed orders immediately
+
+# Order optimization features
+order_optimization_enabled: true
+ask_order_optimization_depth: 1  # Check 1 level for optimization (fast)
+bid_order_optimization_depth: 1  # Check 1 level for optimization (fast)
+
+# Add transaction costs - critical for HFT profitability
+add_transaction_costs: true
+
+# Advanced HFT features
+price_floor: 0.0  # No price floor
+price_ceiling: 1000000.0  # No practical ceiling
+
+# Ping pong feature - useful for HFT market making
+ping_pong_enabled: true
+ping_pong_warning_enabled: false  # Disable warnings for HFT
+
+# Order override - disabled for HFT (use algorithmic decisions)
+order_override: null
+
+# HFT-specific parameters (these work with valr_hft connector)
+# These are set in the connector configuration but listed here for reference:
+# - use_websocket_order_placement: true (sub-10ms latency)
+# - order_timeout_ms: 100 (100ms timeout for ultra-fast failures)
+# - enable_l1_orderbook_optimization: true (microsecond price updates)
+# - connection_pool_size: 3 (multiple connections for reliability)
+# - max_batch_orders: 10 (batch operations for efficiency)
+# - circuit_breaker_failure_threshold: 5 (automatic failure recovery)
+# - adaptive_reconnect_enabled: true (handles VALR's 30s disconnects)
+
+# Risk management for HFT
+filled_order_delay: 1.0  # 1 second delay after fills
+hanging_orders_enabled: false  # Disable for HFT
+hanging_orders_cancel_after: 10.0  # Not used when disabled
+
+# Notes for HFT on VALR:
+# 1. Ensure your API key has WebSocket trading permissions
+# 2. Monitor rate limits: 400/s for orders, 450/s for cancellations
+# 3. Use VPS/cloud hosting close to VALR servers for best latency
+# 4. Start with small order_amount and increase gradually
+# 5. Monitor inventory closely - HFT can accumulate positions quickly
+# 6. Set appropriate stop-loss and daily loss limits externally

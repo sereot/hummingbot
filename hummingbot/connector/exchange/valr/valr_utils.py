@@ -78,9 +78,85 @@ class ValrConfigMap(BaseConnectorConfigMap):
 
 KEYS = ValrConfigMap.model_construct()
 
-# VALR doesn't have other domains/sub-exchanges
-OTHER_DOMAINS = []
-OTHER_DOMAINS_PARAMETER = {}
-OTHER_DOMAINS_EXAMPLE_PAIR = {}
-OTHER_DOMAINS_DEFAULT_FEES = {}
-OTHER_DOMAINS_KEYS = {}
+# VALR HFT domain configuration
+OTHER_DOMAINS = ["valr_hft"]
+OTHER_DOMAINS_PARAMETER = {"valr_hft": "valr_hft"}
+OTHER_DOMAINS_EXAMPLE_PAIR = {"valr_hft": "BTC-ZAR"}
+OTHER_DOMAINS_DEFAULT_FEES = {"valr_hft": DEFAULT_FEES}
+
+
+class ValrHFTConfigMap(BaseConnectorConfigMap):
+    """Configuration for VALR HFT connector variant."""
+    connector: str = "valr_hft"
+    valr_api_key: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your VALR API key",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    valr_api_secret: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your VALR API secret", 
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    # HFT-specific configuration
+    use_websocket_order_placement: bool = Field(
+        default=True,
+        json_schema_extra={
+            "prompt": lambda cm: "Enable WebSocket order placement for ultra-low latency? (Yes/No)",
+            "prompt_on_new": False,
+        }
+    )
+    order_timeout_ms: int = Field(
+        default=100,
+        json_schema_extra={
+            "prompt": lambda cm: "Order timeout in milliseconds (default: 100)",
+            "prompt_on_new": False,
+        }
+    )
+    enable_l1_orderbook_optimization: bool = Field(
+        default=True,
+        json_schema_extra={
+            "prompt": lambda cm: "Enable L1 order book optimization? (Yes/No)",
+            "prompt_on_new": False,
+        }
+    )
+    connection_pool_size: int = Field(
+        default=3,
+        json_schema_extra={
+            "prompt": lambda cm: "WebSocket connection pool size (default: 3)",
+            "prompt_on_new": False,
+        }
+    )
+    max_batch_orders: int = Field(
+        default=10,
+        json_schema_extra={
+            "prompt": lambda cm: "Maximum orders per batch (default: 10)",
+            "prompt_on_new": False,
+        }
+    )
+    circuit_breaker_failure_threshold: int = Field(
+        default=5,
+        json_schema_extra={
+            "prompt": lambda cm: "Circuit breaker failure threshold (default: 5)",
+            "prompt_on_new": False,
+        }
+    )
+    adaptive_reconnect_enabled: bool = Field(
+        default=True,
+        json_schema_extra={
+            "prompt": lambda cm: "Enable adaptive reconnection for VALR's 30s disconnects? (Yes/No)",
+            "prompt_on_new": False,
+        }
+    )
+    model_config = ConfigDict(title="valr_hft")
+
+
+OTHER_DOMAINS_KEYS = {"valr_hft": ValrHFTConfigMap.model_construct()}

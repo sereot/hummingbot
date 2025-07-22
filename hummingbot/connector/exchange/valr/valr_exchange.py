@@ -206,9 +206,28 @@ class ValrExchange(ExchangePyBase):
             # Schedule a task to force ready state after timeout if needed
             asyncio.create_task(self._ready_state_timeout_task())
             self.logger().info("Scheduled force ready task")
+            
+            # Schedule circuit breaker recovery check
+            asyncio.create_task(self._circuit_breaker_recovery_check())
         except Exception as e:
             self.logger().error(f"Error scheduling ready state timeout: {e}")
 
+    async def _circuit_breaker_recovery_check(self):
+        """
+        Periodically check circuit breaker state and re-enable WebSocket operations when recovered.
+        """
+        while True:
+            try:
+                await asyncio.sleep(30)  # Check every 30 seconds
+                
+                if not self._use_websocket_for_orders:
+                    ws_breaker = self._circuit_breakers.get_breaker("websocket")
+                    if ws_breaker.state == "closed":
+                        self.logger().info("Circuit breaker recovered - re-enabling WebSocket operations")
+                        self._use_websocket_for_orders = True
+            except Exception as e:
+                self.logger().error(f"Error in circuit breaker recovery check: {e}")
+                
     async def _ready_state_timeout_task(self):
         """
         Force ready state after a timeout to handle VALR's connection patterns.
@@ -531,14 +550,22 @@ class ValrExchange(ExchangePyBase):
         success = False
         
         try:
-            # Try WebSocket order placement first if enabled
-            if self._ws_order_placement_enabled and self._use_websocket_for_orders:
+            # Check if circuit breaker allows WebSocket operations
+            ws_breaker = self._circuit_breakers.get_breaker("websocket")
+            
+            # Try WebSocket order placement first if enabled and circuit breaker is not open
+            if self._ws_order_placement_enabled and self._use_websocket_for_orders and ws_breaker.state != "open":
                 try:
                     exchange_order_id, timestamp = await self._place_order_websocket(
                         order_id, trading_pair, amount, trade_type, order_type, price
                     )
                     success = True
                     return exchange_order_id, timestamp
+                except CircuitOpenError as e:
+                    self.logger().warning(f"WebSocket circuit breaker OPEN, falling back to REST: {e}")
+                    self._performance_metrics.record_error("ws_circuit_breaker_open")
+                    # Temporarily disable WebSocket operations
+                    self._use_websocket_for_orders = False
                 except Exception as e:
                     self.logger().warning(f"WebSocket order placement failed, falling back to REST: {e}")
                     self._performance_metrics.record_error("ws_order_placement_failed")
@@ -635,41 +662,83 @@ class ValrExchange(ExchangePyBase):
             ws_assistant = user_stream_data_source._ws_assistant
             
             # Prepare WebSocket order message
-            order_message = WSJSONRequest({
-                "type": CONSTANTS.WS_PLACE_LIMIT_ORDER_EVENT if order_type == OrderType.LIMIT else CONSTANTS.WS_PLACE_MARKET_ORDER_EVENT,
-                "clientMsgId": client_msg_id,
-                "data": {
-                    "pair": web_utils.convert_to_exchange_trading_pair(trading_pair),
-                    "side": "BUY" if trade_type == TradeType.BUY else "SELL",
-                    "quantity": str(amount),
-                    "price": str(price),
-                    "postOnly": order_type == OrderType.LIMIT_MAKER,
-                    "customerOrderId": order_id,
-                }
-            })
+            order_data = {
+                "pair": web_utils.convert_to_exchange_trading_pair(trading_pair),
+                "side": "BUY" if trade_type == TradeType.BUY else "SELL",
+                "quantity": str(amount),
+                "customerOrderId": order_id,
+                "allowMargin": False  # Required field for VALR
+            }
+            
+            # Add price for limit orders
+            if order_type == OrderType.LIMIT or order_type == OrderType.LIMIT_MAKER:
+                order_data["price"] = str(price)
+                order_data["postOnly"] = order_type == OrderType.LIMIT_MAKER
+                order_data["timeInForce"] = "GTC"  # Good Till Cancelled
+            
+            # VALR expects "payload" not "data" for order placement
+            order_message = WSJSONRequest(
+                payload={
+                    "type": CONSTANTS.WS_PLACE_LIMIT_ORDER_EVENT if order_type == OrderType.LIMIT else CONSTANTS.WS_PLACE_MARKET_ORDER_EVENT,
+                    "clientMsgId": client_msg_id,
+                    "payload": order_data  # Changed from "data" to "payload"
+                },
+                is_auth_required=True  # Enable authentication for order placement
+            )
             
             # Create future for response tracking
             response_future = asyncio.Future()
             self._ws_order_requests[client_msg_id] = response_future
             
+            # Register future with user stream data source BEFORE sending
+            user_stream_data_source.register_order_future(client_msg_id, response_future)
+            
             try:
                 # Send order message
                 await ws_assistant.send(order_message)
-                self.logger().debug(f"Sent WebSocket order placement: {client_msg_id}")
+                self.logger().info(f"Sent WebSocket order placement: {client_msg_id} for {trading_pair} "
+                                  f"{trade_type.name} {amount} @ {price}")
                 
                 # Wait for response with timeout (optimized for HFT)
                 response = await asyncio.wait_for(response_future, timeout=CONSTANTS.WS_ORDER_TIMEOUT)
                 
                 # Extract order ID from response
-                if response.get("type") == CONSTANTS.WS_ORDER_RESPONSE_EVENT:
-                    exchange_order_id = str(response["data"]["orderId"])
+                self.logger().info(f"Received WebSocket order response: {response.get('type')} for {client_msg_id}")
+                
+                # Check for error in response first
+                if "error" in response:
+                    error_code = response["error"].get("code", "Unknown")
+                    error_msg = response["error"].get("message", "Unknown error")
+                    self.logger().error(f"WebSocket order placement failed with code {error_code}: {error_msg}")
+                    raise Exception(f"Order placement failed: {error_msg}")
+                
+                if response.get("type") in ["ORDER_PLACED", "PLACE_LIMIT_WS_RESPONSE", "PLACE_MARKET_WS_RESPONSE"]:
+                    # Handle different response formats
+                    if "orderId" in response.get("data", {}):
+                        exchange_order_id = str(response["data"]["orderId"])
+                    elif "id" in response.get("data", {}):
+                        exchange_order_id = str(response["data"]["id"])
+                    else:
+                        # Log the full response to understand the format
+                        self.logger().warning(f"Unknown order response format: {response}")
+                        raise Exception(f"Cannot extract order ID from response: {response}")
+                    
+                    self.logger().info(f"Order placed successfully via WebSocket: {exchange_order_id}")
                     return exchange_order_id
+                elif response.get("type") == "ORDER_FAILED":
+                    error_msg = response.get("data", {}).get("message", "Unknown error")
+                    self.logger().error(f"WebSocket order placement failed: {error_msg}")
+                    raise Exception(f"Order placement failed: {error_msg}")
                 else:
-                    raise Exception(f"Order placement failed: {response}")
+                    self.logger().error(f"Unexpected WebSocket order response: {response}")
+                    raise Exception(f"Unexpected order response: {response}")
                     
             except asyncio.TimeoutError:
+                self.logger().warning(f"WebSocket order placement timed out after {CONSTANTS.WS_ORDER_TIMEOUT}s "
+                                     f"for {client_msg_id}")
                 raise Exception("WebSocket order placement timed out")
             except Exception as e:
+                self.logger().error(f"WebSocket order placement error for {client_msg_id}: {e}")
                 raise Exception(f"WebSocket order placement error: {e}")
             finally:
                 # Clean up future
@@ -703,12 +772,20 @@ class ValrExchange(ExchangePyBase):
         result = None
         
         try:
-            # Try WebSocket cancellation first if enabled
-            if self._ws_order_placement_enabled and self._use_websocket_for_orders:
+            # Check if circuit breaker allows WebSocket operations
+            ws_breaker = self._circuit_breakers.get_breaker("websocket")
+            
+            # Try WebSocket cancellation first if enabled and circuit breaker is not open
+            if self._ws_order_placement_enabled and self._use_websocket_for_orders and ws_breaker.state != "open":
                 try:
                     result = await self._cancel_order_websocket(order_id, tracked_order)
                     success = True
                     return result
+                except CircuitOpenError as e:
+                    self.logger().warning(f"WebSocket circuit breaker OPEN, falling back to REST: {e}")
+                    self._performance_metrics.record_error("ws_circuit_breaker_open")
+                    # Temporarily disable WebSocket operations
+                    self._use_websocket_for_orders = False
                 except Exception as e:
                     self.logger().warning(f"WebSocket order cancellation failed, falling back to REST: {e}")
                     self._performance_metrics.record_error("ws_cancel_failed")
@@ -784,19 +861,25 @@ class ValrExchange(ExchangePyBase):
         # Convert trading pair to VALR format
         valr_pair = web_utils.convert_to_exchange_trading_pair(tracked_order.trading_pair)
         
-        # Prepare WebSocket cancel message
-        cancel_message = WSJSONRequest({
-            "type": CONSTANTS.WS_PLACE_CANCEL_ORDER_EVENT,
-            "clientMsgId": client_msg_id,
-            "data": {
-                "customerOrderId": order_id,
-                "pair": valr_pair
-            }
-        })
+        # Prepare WebSocket cancel message (VALR expects "payload" not "data")
+        cancel_message = WSJSONRequest(
+            payload={
+                "type": CONSTANTS.WS_PLACE_CANCEL_ORDER_EVENT,
+                "clientMsgId": client_msg_id,
+                "payload": {  # Changed from "data" to "payload"
+                    "customerOrderId": order_id,
+                    "pair": valr_pair
+                }
+            },
+            is_auth_required=True  # Enable authentication for order cancellation
+        )
         
         # Create future for response tracking
         response_future = asyncio.Future()
         self._ws_order_requests[client_msg_id] = response_future
+        
+        # Register future with user stream data source BEFORE sending
+        user_stream_data_source.register_order_future(client_msg_id, response_future)
         
         try:
             # Send cancel message
@@ -807,11 +890,14 @@ class ValrExchange(ExchangePyBase):
             response = await asyncio.wait_for(response_future, timeout=CONSTANTS.WS_ORDER_TIMEOUT)
             
             # Check if cancellation was successful
-            if response.get("type") == CONSTANTS.WS_USER_ORDER_CANCEL_EVENT:
+            if response.get("type") == "CANCEL_ORDER_SUCCESS":
                 self.logger().info(f"Successfully cancelled order {order_id} via WebSocket")
                 return response
+            elif response.get("type") == "CANCEL_ORDER_FAILED":
+                error_msg = response.get("data", {}).get("message", "Unknown error")
+                raise Exception(f"Order cancellation failed: {error_msg}")
             else:
-                raise Exception(f"Order cancellation failed: {response}")
+                raise Exception(f"Unexpected cancel response: {response}")
                 
         except asyncio.TimeoutError:
             raise Exception("WebSocket order cancellation timed out")
@@ -988,15 +1074,18 @@ class ValrExchange(ExchangePyBase):
         if new_quantity is not None:
             modify_data["quantity"] = str(new_quantity)
             
-        ws_message = {
-            "type": CONSTANTS.WS_MODIFY_ORDER_EVENT,
-            "data": modify_data,
-            "messageId": client_msg_id
-        }
+        ws_message = WSJSONRequest(
+            payload={
+                "type": CONSTANTS.WS_MODIFY_ORDER_EVENT,
+                "data": modify_data,
+                "messageId": client_msg_id
+            },
+            is_auth_required=True  # Enable authentication for order modification
+        )
         
         try:
             # Send modification request
-            await ws_assistant.send(json.dumps(ws_message))
+            await ws_assistant.send(ws_message)
             self.logger().debug(f"Sent WebSocket order modification: {client_msg_id}")
             
             # Wait for response with timeout
@@ -1147,11 +1236,14 @@ class ValrExchange(ExchangePyBase):
             }
             batch_data.append(order_data)
         
-        batch_message = WSJSONRequest({
-            "type": CONSTANTS.WS_BATCH_ORDERS_EVENT,
-            "clientMsgId": client_msg_id,
-            "data": {"orders": batch_data}
-        })
+        batch_message = WSJSONRequest(
+            payload={
+                "type": CONSTANTS.WS_BATCH_ORDERS_EVENT,
+                "clientMsgId": client_msg_id,
+                "data": {"orders": batch_data}
+            },
+            is_auth_required=True  # Enable authentication for batch orders
+        )
         
         # Create future for response tracking
         response_future = asyncio.Future()

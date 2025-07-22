@@ -68,6 +68,10 @@ WS_ORDER_RESPONSE_EVENT = "ORDER_PLACED"
 WS_ORDER_FAILED_EVENT = "ORDER_FAILED"
 WS_ORDER_PROCESSED_EVENT = "ORDER_PROCESSED"
 WS_MODIFY_ORDER_OUTCOME_EVENT = "MODIFY_ORDER_OUTCOME"
+# Additional WebSocket response types discovered during testing
+WS_PLACE_LIMIT_RESPONSE_EVENT = "PLACE_LIMIT_WS_RESPONSE"
+WS_PLACE_MARKET_RESPONSE_EVENT = "PLACE_MARKET_WS_RESPONSE"
+WS_CANCEL_ORDER_RESPONSE_EVENT = "CANCEL_ORDER_WS_RESPONSE"
 
 # WebSocket market data event types (HFT optimized)
 WS_OB_L1_DIFF_EVENT = "OB_L1_DIFF"  # Rapid order book updates
@@ -81,11 +85,12 @@ API_MAX_RETRIES = 4
 READY_STATE_TIMEOUT = 60.0  # Maximum time to wait for connector to reach ready state
 SYMBOL_MAPPING_TIMEOUT = 30.0  # Maximum time to wait for symbol mapping initialization
 
-# HFT-specific timeouts
-WS_ORDER_TIMEOUT = 3.0  # Increased for better reliability during initial connection
-WS_ORDER_MODIFY_TIMEOUT = 3.0  # Timeout for order modifications
-WS_BATCH_ORDER_TIMEOUT = 5.0  # Slightly longer for batch operations
-REST_ORDER_TIMEOUT = 5.0  # Fallback REST timeout
+# HFT-specific timeouts (balanced for reliability and speed)
+WS_ORDER_TIMEOUT = 1.0  # 1s for reliable order placement
+WS_ORDER_MODIFY_TIMEOUT = 1.0  # 1s for modifications
+WS_BATCH_ORDER_TIMEOUT = 2.0  # 2s for batch operations
+REST_ORDER_TIMEOUT = 3.0  # 3s fallback REST timeout
+WS_CANCEL_TIMEOUT = 1.0  # 1s for cancellations
 
 # Connection Health Monitoring
 CONNECTION_HEALTH_CHECK_INTERVAL = 60.0  # Check connection health every 60 seconds

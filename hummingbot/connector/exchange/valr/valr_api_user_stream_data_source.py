@@ -1,6 +1,7 @@
 import asyncio
+import json
 import time
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from hummingbot.connector.exchange.valr import valr_constants as CONSTANTS, valr_web_utils as web_utils
 from hummingbot.connector.exchange.valr.valr_auth import ValrAuth
@@ -38,6 +39,9 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._last_recv_time: float = 0  # Track last received time for REST fallback mode
         self._ws_assistant: WSAssistant | None = None  # Store WebSocket assistant reference
         
+        # Order response futures for WebSocket order placement
+        self._order_response_futures: Dict[str, asyncio.Future] = {}  # clientMsgId -> Future
+        
         # Connection pool for HFT optimization
         self._connection_pool: Optional[VALRConnectionPool] = None
         self._use_connection_pool = True  # Enable by default for HFT
@@ -60,6 +64,17 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
             'disconnect_pattern': []  # Track disconnect intervals for pattern analysis
         }
     
+    def register_order_future(self, client_msg_id: str, future: asyncio.Future):
+        """
+        Register a future waiting for order response.
+        
+        Args:
+            client_msg_id: The client message ID to correlate response
+            future: The future to resolve when response is received
+        """
+        self._order_response_futures[client_msg_id] = future
+        self.logger().debug(f"Registered order future for clientMsgId: {client_msg_id}")
+
     @property
     def last_recv_time(self) -> float:
         """
@@ -377,15 +392,59 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                             continue
                         elif event_message.upper() == "PING":
                             # Send PONG response
-                            await websocket_assistant.send(WSJSONRequest({"type": "PONG"}))
+                            pong_message = WSJSONRequest(
+                                payload={"type": "PONG"},
+                                is_auth_required=False  # PONG doesn't need auth
+                            )
+                            await websocket_assistant.send(pong_message)
                             self.logger().debug("Sent PONG response to VALR")
                             continue
                     
-                    # Log received messages for debugging
-                    self.logger().debug(f"Received user stream message: {event_message}")
-                    
-                    # Place the message in the output queue
-                    output.put_nowait(event_message)
+                    # Parse message and route order responses
+                    try:
+                        # Handle string messages (already handled above for PING/PONG)
+                        if isinstance(event_message, str):
+                            # Try to parse as JSON
+                            try:
+                                event_message = json.loads(event_message)
+                            except json.JSONDecodeError:
+                                # Not JSON, skip
+                                self.logger().debug(f"Received non-JSON user stream message: {event_message}")
+                                continue
+                        
+                        # Check if this is an order response that needs routing
+                        msg_type = event_message.get("type") if isinstance(event_message, dict) else None
+                        
+                        if msg_type in ["ORDER_PLACED", "ORDER_FAILED", "ORDER_PROCESSED", 
+                                       "CANCEL_ORDER_SUCCESS", "CANCEL_ORDER_FAILED",
+                                       "MODIFY_ORDER_OUTCOME", "PLACE_LIMIT_WS_RESPONSE",
+                                       "PLACE_MARKET_WS_RESPONSE", "CANCEL_ORDER_WS_RESPONSE"]:
+                            # Try to find clientMsgId in message
+                            client_msg_id = event_message.get("clientMsgId")
+                            if not client_msg_id and isinstance(event_message.get("data"), dict):
+                                # Sometimes clientMsgId might be in data field
+                                client_msg_id = event_message["data"].get("clientMsgId")
+                            
+                            if client_msg_id and client_msg_id in self._order_response_futures:
+                                # Route to waiting future
+                                future = self._order_response_futures.pop(client_msg_id)
+                                if not future.done():
+                                    future.set_result(event_message)
+                                    self.logger().info(f"Routed {msg_type} response for clientMsgId: {client_msg_id}")
+                                continue  # Don't put in output queue
+                            elif client_msg_id:
+                                self.logger().debug(f"No pending future for {msg_type} with clientMsgId: {client_msg_id}")
+                        
+                        # Log received messages for debugging
+                        self.logger().debug(f"Received user stream message: {event_message}")
+                        
+                        # Place the message in the output queue
+                        output.put_nowait(event_message)
+                        
+                    except Exception as e:
+                        self.logger().error(f"Error processing user stream message: {e}")
+                        # Still put the original message in queue even if processing failed
+                        output.put_nowait(event_message)
                     
             except asyncio.CancelledError:
                 self.logger().info("User stream listener cancelled - shutting down gracefully")
@@ -470,20 +529,30 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
     async def _send_ping_messages(self, websocket_assistant):
         """
         Sends periodic PING messages to maintain WebSocket connection.
-        VALR requires ping every 30 seconds to keep the connection alive.
+        VALR disconnects after ~30 seconds, so we ping more frequently.
         
         Args:
             websocket_assistant: The WebSocket assistant to send pings through
         """
         try:
+            consecutive_failures = 0
             while True:
-                await asyncio.sleep(30)  # VALR requires ping every 30 seconds
+                # Send ping every 20 seconds (before the 30s timeout)
+                await asyncio.sleep(20)
                 try:
-                    await websocket_assistant.send(WSJSONRequest({"type": "PING"}))
+                    ping_message = WSJSONRequest(
+                        payload={"type": "PING"},
+                        is_auth_required=False  # PING doesn't need auth
+                    )
+                    await websocket_assistant.send(ping_message)
                     self.logger().debug("Sent PING message to VALR account WebSocket")
+                    consecutive_failures = 0  # Reset on success
                 except Exception as e:
-                    self.logger().warning(f"Failed to send PING message: {e}")
-                    break
+                    consecutive_failures += 1
+                    self.logger().warning(f"Failed to send PING message (attempt {consecutive_failures}): {e}")
+                    if consecutive_failures >= 3:
+                        self.logger().error("Multiple PING failures - connection likely dead")
+                        break
         except asyncio.CancelledError:
             self.logger().debug("Ping task cancelled")
             raise
