@@ -1,15 +1,24 @@
 import asyncio
 import json
 import logging
+import time
 import uuid
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, List, Dict, Optional, Tuple
 
 from hummingbot.connector.exchange.valr import valr_constants as CONSTANTS, valr_web_utils as web_utils
 from hummingbot.connector.exchange.valr.valr_api_order_book_data_source import ValrAPIOrderBookDataSource
 from hummingbot.connector.exchange.valr.valr_api_user_stream_data_source import ValrAPIUserStreamDataSource
 from hummingbot.connector.exchange.valr.valr_auth import ValrAuth
 from hummingbot.connector.exchange.valr.valr_utils import ValrConfigMap
+from hummingbot.connector.exchange.valr.valr_performance_metrics import PerformanceMetrics
+from hummingbot.connector.exchange.valr.valr_circuit_breaker import (
+    CircuitBreakerManager, 
+    CircuitBreakerConfig, 
+    CircuitOpenError,
+    RateLimitCircuitBreaker,
+    ConnectionCircuitBreaker
+)
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.connector.utils import combine_to_hb_trading_pair
@@ -59,12 +68,69 @@ class ValrExchange(ExchangePyBase):
         self._ready_state_override = False
         self._initialization_start_time = None
         
+        # Performance metrics tracking
+        self._performance_metrics = PerformanceMetrics()
+        
+        # Circuit breaker management
+        self._circuit_breakers = CircuitBreakerManager()
+        self._init_circuit_breakers()
+        
+        # HFT optimization flags
+        self._use_websocket_for_orders = True  # Primary mode for low latency
+        self._enable_batch_operations = True   # Batch multiple operations
+        self._enable_ob_l1_diff = True        # Use rapid order book updates
+        
         super().__init__(client_config_map)
         
         self.logger().info(f"VALR Connector initialized - trading_pairs: {self._trading_pairs}")
         
         # Schedule ready state timeout check for VALR
         self._schedule_ready_state_timeout()
+        
+    def _init_circuit_breakers(self):
+        """Initialize circuit breakers for different API operations"""
+        # Order placement circuit breaker
+        self._circuit_breakers.get_breaker(
+            "order_placement",
+            CircuitBreakerConfig(
+                failure_threshold=5,
+                success_threshold=2,
+                timeout=30.0
+            )
+        )
+        
+        # Rate limit circuit breaker
+        self._circuit_breakers.get_breaker(
+            "rate_limit",
+            CircuitBreakerConfig(
+                failure_threshold=3,
+                success_threshold=1,
+                timeout=60.0,
+                initial_timeout=60.0
+            )
+        )
+        
+        # WebSocket connection circuit breaker
+        self._circuit_breakers.get_breaker(
+            "websocket",
+            CircuitBreakerConfig(
+                failure_threshold=5,
+                success_threshold=3,
+                timeout=30.0
+            )
+        )
+        
+        # Market data circuit breaker
+        self._circuit_breakers.get_breaker(
+            "market_data",
+            CircuitBreakerConfig(
+                failure_threshold=10,
+                success_threshold=3,
+                timeout=15.0
+            )
+        )
+        
+        # Performance monitoring will be started when ready
 
     @property
     def authenticator(self):
@@ -459,18 +525,35 @@ class ValrExchange(ExchangePyBase):
         **kwargs
     ) -> tuple[str, float]:
         
-        # Try WebSocket order placement first if enabled
-        if self._ws_order_placement_enabled:
-            try:
-                exchange_order_id, timestamp = await self._place_order_websocket(
-                    order_id, trading_pair, amount, trade_type, order_type, price
-                )
-                return exchange_order_id, timestamp
-            except Exception as e:
-                self.logger().warning(f"WebSocket order placement failed, falling back to REST: {e}")
-                
-        # Fallback to REST API order placement
-        return await self._place_order_rest(order_id, trading_pair, amount, trade_type, order_type, price)
+        start_time = time.perf_counter()
+        exchange_order_id = None
+        timestamp = None
+        success = False
+        
+        try:
+            # Try WebSocket order placement first if enabled
+            if self._ws_order_placement_enabled and self._use_websocket_for_orders:
+                try:
+                    exchange_order_id, timestamp = await self._place_order_websocket(
+                        order_id, trading_pair, amount, trade_type, order_type, price
+                    )
+                    success = True
+                    return exchange_order_id, timestamp
+                except Exception as e:
+                    self.logger().warning(f"WebSocket order placement failed, falling back to REST: {e}")
+                    self._performance_metrics.record_error("ws_order_placement_failed")
+                    
+            # Fallback to REST API order placement
+            exchange_order_id, timestamp = await self._place_order_rest(
+                order_id, trading_pair, amount, trade_type, order_type, price
+            )
+            success = True
+            return exchange_order_id, timestamp
+            
+        finally:
+            # Record performance metrics
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            self._performance_metrics.record_order_placement(latency_ms, success)
     
     async def _place_order_rest(
         self,
@@ -481,32 +564,44 @@ class ValrExchange(ExchangePyBase):
         order_type: OrderType,
         price: Decimal,
     ) -> tuple[str, float]:
-        """Place order via REST API (original implementation)"""
+        """Place order via REST API with circuit breaker protection"""
         
-        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+        # Get circuit breaker for order placement
+        order_breaker = self._circuit_breakers.get_breaker("order_placement")
         
-        # Prepare order data
-        order_data = {
-            "side": "BUY" if trade_type == TradeType.BUY else "SELL",
-            "quantity": str(amount),
-            "price": str(price),
-            "pair": web_utils.convert_to_exchange_trading_pair(trading_pair),
-            "postOnly": order_type == OrderType.LIMIT_MAKER,
-            "customerOrderId": order_id,
-        }
+        async def _execute_order():
+            rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+            
+            # Prepare order data
+            order_data = {
+                "side": "BUY" if trade_type == TradeType.BUY else "SELL",
+                "quantity": str(amount),
+                "price": str(price),
+                "pair": web_utils.convert_to_exchange_trading_pair(trading_pair),
+                "postOnly": order_type == OrderType.LIMIT_MAKER,
+                "customerOrderId": order_id,
+            }
+            
+            # Send order request
+            order_result = await rest_assistant.execute_request(
+                url=web_utils.private_rest_url(CONSTANTS.PLACE_ORDER_PATH_URL),
+                method=RESTMethod.POST,
+                data=order_data,
+                throttler_limit_id=CONSTANTS.PLACE_ORDER_PATH_URL,
+                is_auth_required=True,
+            )
+            
+            return str(order_result["id"])
         
-        # Send order request
-        order_result = await rest_assistant.execute_request(
-            url=web_utils.private_rest_url(CONSTANTS.PLACE_ORDER_PATH_URL),
-            method=RESTMethod.POST,
-            data=order_data,
-            throttler_limit_id=CONSTANTS.PLACE_ORDER_PATH_URL,
-            is_auth_required=True,
-        )
-        
-        exchange_order_id = str(order_result["id"])
-        
-        return exchange_order_id, self.current_timestamp
+        try:
+            # Execute with circuit breaker protection
+            exchange_order_id = await order_breaker.run(_execute_order)
+            return exchange_order_id, self.current_timestamp
+            
+        except CircuitOpenError as e:
+            self.logger().error(f"Circuit breaker OPEN for order placement: {e}")
+            self._performance_metrics.record_error("circuit_breaker_open")
+            raise
     
     async def _place_order_websocket(
         self,
@@ -517,62 +612,77 @@ class ValrExchange(ExchangePyBase):
         order_type: OrderType,
         price: Decimal,
     ) -> tuple[str, float]:
-        """Place order via WebSocket"""
+        """Place order via WebSocket with circuit breaker protection"""
         
-        # Generate unique client message ID for correlation
-        client_msg_id = str(uuid.uuid4())
+        # Get circuit breaker for WebSocket operations
+        ws_breaker = self._circuit_breakers.get_breaker("websocket")
         
-        # Get WebSocket assistant from user stream data source
-        if not hasattr(self, '_user_stream_tracker') or not self._user_stream_tracker:
-            raise Exception("User stream tracker not available for WebSocket order placement")
-        
-        user_stream_data_source = self._user_stream_tracker.data_source
-        if not hasattr(user_stream_data_source, '_ws_assistant') or not user_stream_data_source._ws_assistant:
-            raise Exception("WebSocket assistant not available for order placement")
-        
-        ws_assistant = user_stream_data_source._ws_assistant
-        
-        # Prepare WebSocket order message
-        order_message = WSJSONRequest({
-            "type": CONSTANTS.WS_PLACE_LIMIT_ORDER_EVENT if order_type == OrderType.LIMIT else CONSTANTS.WS_PLACE_MARKET_ORDER_EVENT,
-            "clientMsgId": client_msg_id,
-            "data": {
-                "pair": web_utils.convert_to_exchange_trading_pair(trading_pair),
-                "side": "BUY" if trade_type == TradeType.BUY else "SELL",
-                "quantity": str(amount),
-                "price": str(price),
-                "postOnly": order_type == OrderType.LIMIT_MAKER,
-                "customerOrderId": order_id,
-            }
-        })
-        
-        # Create future for response tracking
-        response_future = asyncio.Future()
-        self._ws_order_requests[client_msg_id] = response_future
+        async def _execute_ws_order():
+            # Generate unique client message ID for correlation
+            client_msg_id = str(uuid.uuid4())
+            
+            # Get WebSocket assistant from user stream data source
+            if not hasattr(self, '_user_stream_tracker') or not self._user_stream_tracker:
+                raise Exception("User stream tracker not available for WebSocket order placement")
+            
+            user_stream_data_source = self._user_stream_tracker.data_source
+            if not hasattr(user_stream_data_source, '_ws_assistant') or not user_stream_data_source._ws_assistant:
+                raise Exception("WebSocket assistant not available for order placement")
+            
+            ws_assistant = user_stream_data_source._ws_assistant
+            
+            # Prepare WebSocket order message
+            order_message = WSJSONRequest({
+                "type": CONSTANTS.WS_PLACE_LIMIT_ORDER_EVENT if order_type == OrderType.LIMIT else CONSTANTS.WS_PLACE_MARKET_ORDER_EVENT,
+                "clientMsgId": client_msg_id,
+                "data": {
+                    "pair": web_utils.convert_to_exchange_trading_pair(trading_pair),
+                    "side": "BUY" if trade_type == TradeType.BUY else "SELL",
+                    "quantity": str(amount),
+                    "price": str(price),
+                    "postOnly": order_type == OrderType.LIMIT_MAKER,
+                    "customerOrderId": order_id,
+                }
+            })
+            
+            # Create future for response tracking
+            response_future = asyncio.Future()
+            self._ws_order_requests[client_msg_id] = response_future
+            
+            try:
+                # Send order message
+                await ws_assistant.send(order_message)
+                self.logger().debug(f"Sent WebSocket order placement: {client_msg_id}")
+                
+                # Wait for response with timeout (optimized for HFT)
+                response = await asyncio.wait_for(response_future, timeout=CONSTANTS.WS_ORDER_TIMEOUT)
+                
+                # Extract order ID from response
+                if response.get("type") == CONSTANTS.WS_ORDER_RESPONSE_EVENT:
+                    exchange_order_id = str(response["data"]["orderId"])
+                    return exchange_order_id
+                else:
+                    raise Exception(f"Order placement failed: {response}")
+                    
+            except asyncio.TimeoutError:
+                raise Exception("WebSocket order placement timed out")
+            except Exception as e:
+                raise Exception(f"WebSocket order placement error: {e}")
+            finally:
+                # Clean up future
+                if client_msg_id in self._ws_order_requests:
+                    del self._ws_order_requests[client_msg_id]
         
         try:
-            # Send order message
-            await ws_assistant.send(order_message)
-            self.logger().debug(f"Sent WebSocket order placement: {client_msg_id}")
+            # Execute with circuit breaker protection
+            exchange_order_id = await ws_breaker.run(_execute_ws_order)
+            return exchange_order_id, self.current_timestamp
             
-            # Wait for response with timeout (optimized for HFT)
-            response = await asyncio.wait_for(response_future, timeout=5.0)
-            
-            # Extract order ID from response
-            if response.get("type") == CONSTANTS.WS_ORDER_RESPONSE_EVENT:
-                exchange_order_id = str(response["data"]["orderId"])
-                return exchange_order_id, self.current_timestamp
-            else:
-                raise Exception(f"Order placement failed: {response}")
-                
-        except asyncio.TimeoutError:
-            raise Exception("WebSocket order placement timed out")
-        except Exception as e:
-            raise Exception(f"WebSocket order placement error: {e}")
-        finally:
-            # Clean up future
-            if client_msg_id in self._ws_order_requests:
-                del self._ws_order_requests[client_msg_id]
+        except CircuitOpenError as e:
+            self.logger().error(f"Circuit breaker OPEN for WebSocket operations: {e}")
+            self._performance_metrics.record_error("ws_circuit_breaker_open")
+            # Fall back to REST API by re-raising
+            raise
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         """
@@ -585,15 +695,30 @@ class ValrExchange(ExchangePyBase):
         Returns:
             The API response from the cancellation request
         """
-        # Try WebSocket cancellation first if enabled
-        if self._ws_order_placement_enabled:
-            try:
-                return await self._cancel_order_websocket(order_id, tracked_order)
-            except Exception as e:
-                self.logger().warning(f"WebSocket order cancellation failed, falling back to REST: {e}")
+        start_time = time.perf_counter()
+        success = False
+        result = None
         
-        # Fallback to REST API cancellation
-        return await self._cancel_order_rest(order_id, tracked_order)
+        try:
+            # Try WebSocket cancellation first if enabled
+            if self._ws_order_placement_enabled and self._use_websocket_for_orders:
+                try:
+                    result = await self._cancel_order_websocket(order_id, tracked_order)
+                    success = True
+                    return result
+                except Exception as e:
+                    self.logger().warning(f"WebSocket order cancellation failed, falling back to REST: {e}")
+                    self._performance_metrics.record_error("ws_cancel_failed")
+            
+            # Fallback to REST API cancellation
+            result = await self._cancel_order_rest(order_id, tracked_order)
+            success = True
+            return result
+            
+        finally:
+            # Record performance metrics
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            self._performance_metrics.record_order_cancellation(latency_ms, success)
     
     async def _cancel_order_rest(self, order_id: str, tracked_order: InFlightOrder):
         """Cancel order via REST API (original implementation)."""
@@ -673,7 +798,7 @@ class ValrExchange(ExchangePyBase):
             self.logger().debug(f"Sent WebSocket order cancellation: {client_msg_id}")
             
             # Wait for response with timeout (optimized for HFT)
-            response = await asyncio.wait_for(response_future, timeout=3.0)
+            response = await asyncio.wait_for(response_future, timeout=CONSTANTS.WS_ORDER_TIMEOUT)
             
             # Check if cancellation was successful
             if response.get("type") == CONSTANTS.WS_USER_ORDER_CANCEL_EVENT:
@@ -747,6 +872,370 @@ class ValrExchange(ExchangePyBase):
         # VALR fees are fixed in valr_utils.py
         # Could be enhanced to fetch dynamic fees from API if available
         pass
+    
+    async def modify_order(
+        self,
+        order_id: str,
+        trading_pair: str,
+        new_price: Optional[Decimal] = None,
+        new_quantity: Optional[Decimal] = None
+    ) -> bool:
+        """
+        Modify an existing order using WebSocket for ultra-low latency.
+        
+        Args:
+            order_id: The client order ID
+            trading_pair: The trading pair
+            new_price: New price for the order (optional)
+            new_quantity: New quantity for the order (optional)
+            
+        Returns:
+            True if modification was successful, False otherwise
+        """
+        start_time = time.perf_counter()
+        success = False
+        
+        try:
+            # Get the in-flight order
+            order = self._order_tracker.fetch_tracked_order(order_id)
+            if not order:
+                self.logger().warning(f"Order {order_id} not found in tracker")
+                return False
+                
+            # Try WebSocket modification first if enabled
+            if self._ws_order_placement_enabled and self._use_websocket_for_orders:
+                try:
+                    success = await self._modify_order_websocket(
+                        order.exchange_order_id, 
+                        trading_pair, 
+                        new_price, 
+                        new_quantity
+                    )
+                    if success:
+                        # Update order tracking
+                        if new_price:
+                            order.price = new_price
+                        if new_quantity:
+                            order.amount = new_quantity
+                        return True
+                except Exception as e:
+                    self.logger().warning(f"WebSocket order modification failed, falling back to REST: {e}")
+                    self._performance_metrics.record_error("ws_order_modify_failed")
+                    
+            # Fallback to REST API
+            success = await self._modify_order_rest(
+                order.exchange_order_id,
+                trading_pair,
+                new_price,
+                new_quantity
+            )
+            
+            if success:
+                # Update order tracking
+                if new_price:
+                    order.price = new_price
+                if new_quantity:
+                    order.amount = new_quantity
+                    
+            return success
+            
+        finally:
+            # Record performance metrics
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            self._performance_metrics.record_modification(latency_ms, success)
+            
+    async def _modify_order_websocket(
+        self,
+        exchange_order_id: str,
+        trading_pair: str,
+        new_price: Optional[Decimal] = None,
+        new_quantity: Optional[Decimal] = None
+    ) -> bool:
+        """Modify order via WebSocket for ultra-low latency"""
+        
+        # Generate unique client message ID
+        client_msg_id = str(uuid.uuid4())
+        
+        # Get WebSocket assistant
+        if not hasattr(self, '_user_stream_tracker') or not self._user_stream_tracker:
+            raise Exception("User stream tracker not available for WebSocket order modification")
+            
+        user_stream_data_source = self._user_stream_tracker.data_source
+        if not hasattr(user_stream_data_source, '_ws_assistant') or not user_stream_data_source._ws_assistant:
+            raise Exception("WebSocket assistant not available for order modification")
+            
+        ws_assistant = user_stream_data_source._ws_assistant
+        
+        # Create response future
+        response_future = asyncio.Future()
+        self._ws_order_requests[client_msg_id] = response_future
+        
+        # Prepare modification message
+        modify_data = {
+            "orderId": exchange_order_id,
+            "pair": web_utils.convert_to_exchange_trading_pair(trading_pair)
+        }
+        
+        if new_price is not None:
+            modify_data["price"] = str(new_price)
+            
+        if new_quantity is not None:
+            modify_data["quantity"] = str(new_quantity)
+            
+        ws_message = {
+            "type": CONSTANTS.WS_MODIFY_ORDER_EVENT,
+            "data": modify_data,
+            "messageId": client_msg_id
+        }
+        
+        try:
+            # Send modification request
+            await ws_assistant.send(json.dumps(ws_message))
+            self.logger().debug(f"Sent WebSocket order modification: {client_msg_id}")
+            
+            # Wait for response with timeout
+            response = await asyncio.wait_for(response_future, timeout=CONSTANTS.WS_ORDER_MODIFY_TIMEOUT)
+            
+            # Process response
+            if response.get("success", False):
+                self.logger().info(f"Successfully modified order {exchange_order_id} via WebSocket")
+                return True
+            else:
+                error_msg = response.get("message", "Unknown error")
+                self.logger().warning(f"Order modification failed: {error_msg}")
+                return False
+                
+        except asyncio.TimeoutError:
+            self.logger().warning(f"WebSocket order modification timed out for {exchange_order_id}")
+            raise Exception("WebSocket order modification timed out")
+        except Exception as e:
+            self.logger().error(f"WebSocket order modification error: {e}")
+            raise
+        finally:
+            # Clean up response future
+            self._ws_order_requests.pop(client_msg_id, None)
+            
+    async def _modify_order_rest(
+        self,
+        exchange_order_id: str,
+        trading_pair: str,
+        new_price: Optional[Decimal] = None,
+        new_quantity: Optional[Decimal] = None
+    ) -> bool:
+        """Modify order via REST API"""
+        
+        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+        
+        # Prepare modification data
+        modify_data = {
+            "orderId": exchange_order_id,
+            "pair": web_utils.convert_to_exchange_trading_pair(trading_pair)
+        }
+        
+        if new_price is not None:
+            modify_data["price"] = str(new_price)
+            
+        if new_quantity is not None:
+            modify_data["quantity"] = str(new_quantity)
+            
+        try:
+            response = await rest_assistant.execute_request(
+                url=web_utils.private_rest_url(CONSTANTS.ORDER_MODIFY_PATH_URL),
+                method=RESTMethod.PUT,
+                data=json.dumps(modify_data),
+                headers={"Content-Type": "application/json"},
+                is_auth_required=True,
+                throttler_limit_id=CONSTANTS.ORDER_MODIFY_PATH_URL,
+            )
+            
+            # VALR returns the modified order details on success
+            if "id" in response:
+                self.logger().info(f"Successfully modified order {exchange_order_id} via REST")
+                return True
+            else:
+                self.logger().warning(f"Unexpected response from order modification: {response}")
+                return False
+                
+        except Exception as e:
+            self.logger().error(f"Error modifying order {exchange_order_id}: {e}")
+            return False
+    
+    async def place_batch_orders(
+        self,
+        orders: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Place multiple orders in a single batch operation for HFT efficiency.
+        
+        Args:
+            orders: List of order dictionaries containing:
+                - trading_pair: str
+                - order_type: OrderType
+                - trade_type: TradeType
+                - amount: Decimal
+                - price: Decimal (for limit orders)
+                
+        Returns:
+            List of results for each order
+        """
+        if not self._enable_batch_operations or len(orders) <= 1:
+            # Fall back to individual order placement
+            results = []
+            for order in orders:
+                try:
+                    order_id = self.buy_with_specific_market(
+                        trading_pair=order["trading_pair"],
+                        amount=order["amount"],
+                        order_type=order["order_type"],
+                        price=order.get("price")
+                    ) if order["trade_type"] == TradeType.BUY else self.sell_with_specific_market(
+                        trading_pair=order["trading_pair"],
+                        amount=order["amount"],
+                        order_type=order["order_type"],
+                        price=order.get("price")
+                    )
+                    results.append({"success": True, "order_id": order_id})
+                except Exception as e:
+                    results.append({"success": False, "error": str(e)})
+            return results
+        
+        # Use WebSocket batch if available
+        if self._ws_order_placement_enabled and self._use_websocket_for_orders:
+            try:
+                return await self._place_batch_orders_websocket(orders)
+            except Exception as e:
+                self.logger().warning(f"WebSocket batch order placement failed, falling back to REST: {e}")
+                self._performance_metrics.record_error("ws_batch_failed")
+        
+        # REST API batch endpoint
+        return await self._place_batch_orders_rest(orders)
+    
+    async def _place_batch_orders_websocket(
+        self,
+        orders: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Place batch orders via WebSocket for ultra-low latency"""
+        start_time = time.perf_counter()
+        client_msg_id = str(uuid.uuid4())
+        
+        # Get WebSocket assistant
+        if not hasattr(self, '_user_stream_tracker') or not self._user_stream_tracker:
+            raise Exception("User stream tracker not available for WebSocket batch orders")
+        
+        user_stream_data_source = self._user_stream_tracker.data_source
+        if not hasattr(user_stream_data_source, '_ws_assistant') or not user_stream_data_source._ws_assistant:
+            raise Exception("WebSocket assistant not available for batch orders")
+        
+        ws_assistant = user_stream_data_source._ws_assistant
+        
+        # Prepare batch message
+        batch_data = []
+        for order in orders:
+            order_data = {
+                "pair": web_utils.convert_to_exchange_trading_pair(order["trading_pair"]),
+                "side": "BUY" if order["trade_type"] == TradeType.BUY else "SELL",
+                "quantity": str(order["amount"]),
+                "price": str(order["price"]) if "price" in order else None,
+                "postOnly": order.get("post_only", False),
+                "customerOrderId": order.get("client_order_id", f"HB-{uuid.uuid4().hex[:8]}")
+            }
+            batch_data.append(order_data)
+        
+        batch_message = WSJSONRequest({
+            "type": CONSTANTS.WS_BATCH_ORDERS_EVENT,
+            "clientMsgId": client_msg_id,
+            "data": {"orders": batch_data}
+        })
+        
+        # Create future for response tracking
+        response_future = asyncio.Future()
+        self._ws_order_requests[client_msg_id] = response_future
+        
+        try:
+            # Send batch order message
+            await ws_assistant.send(batch_message)
+            self.logger().debug(f"Sent WebSocket batch order: {client_msg_id} with {len(orders)} orders")
+            
+            # Wait for response
+            response = await asyncio.wait_for(response_future, timeout=CONSTANTS.WS_BATCH_ORDER_TIMEOUT)
+            
+            # Process batch results
+            results = []
+            if response.get("type") == CONSTANTS.WS_ORDER_PROCESSED_EVENT:
+                for idx, order_result in enumerate(response.get("data", {}).get("results", [])):
+                    if order_result.get("success"):
+                        results.append({
+                            "success": True,
+                            "order_id": order_result.get("orderId"),
+                            "client_order_id": orders[idx].get("client_order_id")
+                        })
+                    else:
+                        results.append({
+                            "success": False,
+                            "error": order_result.get("error", "Unknown error")
+                        })
+            
+            # Record metrics
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            success_count = sum(1 for r in results if r["success"])
+            self._performance_metrics.record_order_placement(latency_ms / len(orders), success_count == len(orders))
+            
+            return results
+            
+        except asyncio.TimeoutError:
+            raise Exception("WebSocket batch order placement timed out")
+        except Exception as e:
+            raise Exception(f"WebSocket batch order error: {e}")
+        finally:
+            # Clean up future
+            if client_msg_id in self._ws_order_requests:
+                del self._ws_order_requests[client_msg_id]
+    
+    async def _place_batch_orders_rest(
+        self,
+        orders: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Place batch orders via REST API"""
+        rest_assistant = await self._web_assistants_factory.get_rest_assistant()
+        
+        # Prepare batch request
+        batch_data = []
+        for order in orders:
+            order_data = {
+                "pair": web_utils.convert_to_exchange_trading_pair(order["trading_pair"]),
+                "side": "BUY" if order["trade_type"] == TradeType.BUY else "SELL",
+                "quantity": str(order["amount"]),
+                "price": str(order["price"]) if "price" in order else None,
+                "postOnly": order.get("post_only", False),
+                "customerOrderId": order.get("client_order_id", f"HB-{uuid.uuid4().hex[:8]}")
+            }
+            batch_data.append(order_data)
+        
+        # Send batch request
+        response = await rest_assistant.execute_request(
+            url=web_utils.private_rest_url(CONSTANTS.BATCH_ORDERS_PATH_URL),
+            method=RESTMethod.POST,
+            data={"orders": batch_data},
+            throttler_limit_id=CONSTANTS.BATCH_ORDERS_PATH_URL,
+            is_auth_required=True,
+        )
+        
+        # Process results
+        results = []
+        for order_result in response.get("results", []):
+            if order_result.get("success"):
+                results.append({
+                    "success": True,
+                    "order_id": order_result.get("orderId"),
+                    "client_order_id": order_result.get("customerOrderId")
+                })
+            else:
+                results.append({
+                    "success": False,
+                    "error": order_result.get("error", "Unknown error")
+                })
+        
+        return results
 
     async def _user_stream_event_listener(self):
         """
@@ -774,7 +1263,11 @@ class ValrExchange(ExchangePyBase):
                 elif event_type == CONSTANTS.WS_USER_FAILED_CANCEL_EVENT:
                     self.logger().warning(f"Failed to cancel order: {event_message}")
                     
-                elif event_type in [CONSTANTS.WS_ORDER_RESPONSE_EVENT, CONSTANTS.WS_ORDER_FAILED_EVENT]:
+                elif event_type in [
+                    CONSTANTS.WS_ORDER_RESPONSE_EVENT, 
+                    CONSTANTS.WS_ORDER_FAILED_EVENT,
+                    CONSTANTS.WS_MODIFY_ORDER_OUTCOME_EVENT
+                ]:
                     await self._process_websocket_order_response(event_message)
                     
             except asyncio.CancelledError:
@@ -937,9 +1430,10 @@ class ValrExchange(ExchangePyBase):
             self.logger().exception("Error processing trade update")
     
     async def _process_websocket_order_response(self, event_message: dict[str, Any]):
-        """Process WebSocket order placement response messages."""
+        """Process WebSocket order placement/modification response messages."""
         try:
-            client_msg_id = event_message.get("clientMsgId", "")
+            # Check for different types of message ID fields
+            client_msg_id = event_message.get("clientMsgId") or event_message.get("messageId", "")
             
             if client_msg_id and client_msg_id in self._ws_order_requests:
                 # Complete the future with the response
@@ -948,7 +1442,9 @@ class ValrExchange(ExchangePyBase):
                     future.set_result(event_message)
                     self.logger().debug(f"WebSocket order response processed: {client_msg_id}")
             else:
-                self.logger().debug(f"Received WebSocket order response for unknown clientMsgId: {client_msg_id}")
+                # Log different response types for debugging
+                msg_type = event_message.get("type", "unknown")
+                self.logger().debug(f"Received WebSocket {msg_type} response for unknown ID: {client_msg_id}")
                 
         except Exception:
             self.logger().exception("Error processing WebSocket order response")
@@ -1269,3 +1765,278 @@ class ValrExchange(ExchangePyBase):
                 return float(market_data.get("lastTradedPrice", 0))
                 
         return 0.0
+    
+    async def _performance_monitoring_loop(self):
+        """Background task to monitor and log performance metrics"""
+        while True:
+            try:
+                await asyncio.sleep(60)  # Check every minute
+                
+                # Log performance summary
+                self._performance_metrics.log_performance_summary(self.logger())
+                
+                # Check for performance issues
+                report = self._performance_metrics.get_performance_report()
+                
+                # Alert on high latency
+                if report["latency"]["placement_ms"]["p95"] > 100:
+                    self.logger().warning(
+                        f"High order placement latency detected: "
+                        f"{report['latency']['placement_ms']['p95']:.1f}ms (p95)"
+                    )
+                
+                # Alert on low success rate
+                if report["reliability"]["order_success_rate_pct"] < 95:
+                    self.logger().warning(
+                        f"Low order success rate: "
+                        f"{report['reliability']['order_success_rate_pct']:.1f}%"
+                    )
+                
+                # Alert on memory growth
+                if report["resources"]["memory_growth_mb"] > 100:
+                    self.logger().warning(
+                        f"High memory growth detected: "
+                        f"{report['resources']['memory_growth_mb']:.1f}MB"
+                    )
+                    
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().exception("Error in performance monitoring loop")
+    
+    @property
+    def performance_metrics(self) -> PerformanceMetrics:
+        """Access performance metrics for monitoring"""
+        return self._performance_metrics
+    
+    def get_mid_price_fast(self, trading_pair: str) -> Optional[Decimal]:
+        """
+        Get mid-price with ultra-low latency using L1 optimizer.
+        Falls back to regular order book if L1 data is not available.
+        
+        Args:
+            trading_pair: The trading pair
+            
+        Returns:
+            Mid-price or None if not available
+        """
+        try:
+            # Try L1 optimizer first for ultra-fast access
+            if hasattr(self._order_book_tracker, '_data_source') and hasattr(self._order_book_tracker._data_source, 'l1_optimizer'):
+                l1_optimizer = self._order_book_tracker._data_source.l1_optimizer
+                mid_price = l1_optimizer.get_mid_price(trading_pair)
+                
+                # Check if L1 data is fresh (less than 1 second old)
+                if mid_price is not None and not l1_optimizer.is_l1_stale(trading_pair, max_age_ms=1000):
+                    return mid_price
+            
+            # Fall back to regular order book
+            order_book = self.get_order_book(trading_pair)
+            if order_book:
+                best_bid = order_book.get_best_bid()
+                best_ask = order_book.get_best_ask()
+                if best_bid and best_ask:
+                    return (Decimal(best_bid) + Decimal(best_ask)) / 2
+                    
+        except Exception as e:
+            self.logger().error(f"Error getting fast mid-price for {trading_pair}: {e}")
+            
+        return None
+    
+    def get_best_bid_fast(self, trading_pair: str) -> Optional[Tuple[Decimal, Decimal]]:
+        """
+        Get best bid with ultra-low latency using L1 optimizer.
+        
+        Args:
+            trading_pair: The trading pair
+            
+        Returns:
+            Tuple of (price, quantity) or None if not available
+        """
+        try:
+            # Try L1 optimizer first
+            if hasattr(self._order_book_tracker, '_data_source') and hasattr(self._order_book_tracker._data_source, 'l1_optimizer'):
+                l1_optimizer = self._order_book_tracker._data_source.l1_optimizer
+                
+                # Check if L1 data is fresh
+                if not l1_optimizer.is_l1_stale(trading_pair, max_age_ms=1000):
+                    return l1_optimizer.get_best_bid(trading_pair)
+            
+            # Fall back to regular order book
+            order_book = self.get_order_book(trading_pair)
+            if order_book:
+                best_bid_price = order_book.get_best_bid()
+                if best_bid_price:
+                    # Get quantity from order book
+                    bid_entries = order_book.bid_entries()
+                    if bid_entries:
+                        best_bid_entry = next(iter(bid_entries))
+                        return (Decimal(best_bid_price), best_bid_entry.amount)
+                        
+        except Exception as e:
+            self.logger().error(f"Error getting fast best bid for {trading_pair}: {e}")
+            
+        return None
+    
+    def get_best_ask_fast(self, trading_pair: str) -> Optional[Tuple[Decimal, Decimal]]:
+        """
+        Get best ask with ultra-low latency using L1 optimizer.
+        
+        Args:
+            trading_pair: The trading pair
+            
+        Returns:
+            Tuple of (price, quantity) or None if not available
+        """
+        try:
+            # Try L1 optimizer first
+            if hasattr(self._order_book_tracker, '_data_source') and hasattr(self._order_book_tracker._data_source, 'l1_optimizer'):
+                l1_optimizer = self._order_book_tracker._data_source.l1_optimizer
+                
+                # Check if L1 data is fresh
+                if not l1_optimizer.is_l1_stale(trading_pair, max_age_ms=1000):
+                    return l1_optimizer.get_best_ask(trading_pair)
+            
+            # Fall back to regular order book
+            order_book = self.get_order_book(trading_pair)
+            if order_book:
+                best_ask_price = order_book.get_best_ask()
+                if best_ask_price:
+                    # Get quantity from order book
+                    ask_entries = order_book.ask_entries()
+                    if ask_entries:
+                        best_ask_entry = next(iter(ask_entries))
+                        return (Decimal(best_ask_price), best_ask_entry.amount)
+                        
+        except Exception as e:
+            self.logger().error(f"Error getting fast best ask for {trading_pair}: {e}")
+            
+        return None
+    
+    def get_spread_fast(self, trading_pair: str) -> Optional[Decimal]:
+        """
+        Get spread with ultra-low latency using L1 optimizer.
+        
+        Args:
+            trading_pair: The trading pair
+            
+        Returns:
+            Spread or None if not available
+        """
+        try:
+            # Try L1 optimizer first
+            if hasattr(self._order_book_tracker, '_data_source') and hasattr(self._order_book_tracker._data_source, 'l1_optimizer'):
+                l1_optimizer = self._order_book_tracker._data_source.l1_optimizer
+                
+                # Check if L1 data is fresh
+                if not l1_optimizer.is_l1_stale(trading_pair, max_age_ms=1000):
+                    spread = l1_optimizer.get_spread(trading_pair)
+                    if spread is not None:
+                        return spread
+            
+            # Fall back to calculating from order book
+            best_bid = self.get_best_bid_fast(trading_pair)
+            best_ask = self.get_best_ask_fast(trading_pair)
+            
+            if best_bid and best_ask:
+                return best_ask[0] - best_bid[0]
+                
+        except Exception as e:
+            self.logger().error(f"Error getting fast spread for {trading_pair}: {e}")
+            
+        return None
+    
+    def get_l1_update_frequency(self, trading_pair: str) -> float:
+        """
+        Get the L1 update frequency (updates per second) for monitoring.
+        
+        Args:
+            trading_pair: The trading pair
+            
+        Returns:
+            Updates per second
+        """
+        try:
+            if hasattr(self._order_book_tracker, '_data_source') and hasattr(self._order_book_tracker._data_source, 'l1_optimizer'):
+                return self._order_book_tracker._data_source.l1_optimizer.get_update_frequency(trading_pair)
+        except Exception as e:
+            self.logger().error(f"Error getting L1 update frequency for {trading_pair}: {e}")
+            
+        return 0.0
+    
+    def get_l1_performance_metrics(self) -> Dict[str, Any]:
+        """Get L1 optimizer performance metrics."""
+        try:
+            if hasattr(self._order_book_tracker, '_data_source') and hasattr(self._order_book_tracker._data_source, 'l1_optimizer'):
+                return self._order_book_tracker._data_source.l1_optimizer.get_performance_metrics()
+        except Exception as e:
+            self.logger().error(f"Error getting L1 performance metrics: {e}")
+            
+        return {}
+    
+    def get_circuit_breaker_status(self) -> Dict[str, Dict[str, Any]]:
+        """Get status of all circuit breakers for monitoring."""
+        return self._circuit_breakers.get_all_status()
+    
+    def get_circuit_breaker_health(self) -> Dict[str, Any]:
+        """
+        Get overall circuit breaker health status.
+        
+        Returns:
+            Dict with health score and breaker states
+        """
+        health_score = self._circuit_breakers.get_health_score()
+        all_status = self._circuit_breakers.get_all_status()
+        
+        # Determine overall health state
+        health_state = "healthy"
+        if health_score < 50:
+            health_state = "critical"
+        elif health_score < 80:
+            health_state = "degraded"
+            
+        return {
+            "health_score": health_score,
+            "health_state": health_state,
+            "breakers": all_status,
+            "recommendations": self._get_circuit_breaker_recommendations(all_status)
+        }
+    
+    def _get_circuit_breaker_recommendations(self, breaker_status: Dict[str, Dict[str, Any]]) -> List[str]:
+        """Generate recommendations based on circuit breaker states."""
+        recommendations = []
+        
+        for name, status in breaker_status.items():
+            if status["state"] == "open":
+                if name == "rate_limit":
+                    recommendations.append(f"Rate limit circuit open - reduce order frequency or wait {status['current_timeout']:.0f}s")
+                elif name == "websocket":
+                    recommendations.append("WebSocket circuit open - orders will use REST API fallback")
+                elif name == "order_placement":
+                    recommendations.append("Order placement circuit open - critical issue with order submission")
+                    
+            elif status["state"] == "half_open":
+                recommendations.append(f"{name} circuit testing recovery - monitoring stability")
+                
+        if not recommendations:
+            recommendations.append("All systems operational - circuit breakers healthy")
+            
+        return recommendations
+    
+    def reset_circuit_breaker(self, breaker_name: str = None):
+        """
+        Manually reset circuit breaker(s).
+        
+        Args:
+            breaker_name: Specific breaker to reset, or None to reset all
+        """
+        if breaker_name:
+            breaker = self._circuit_breakers.get_breaker(breaker_name)
+            if breaker:
+                breaker.reset()
+                self.logger().info(f"Circuit breaker '{breaker_name}' has been reset")
+            else:
+                self.logger().warning(f"Circuit breaker '{breaker_name}' not found")
+        else:
+            self._circuit_breakers.reset_all()
+            self.logger().info("All circuit breakers have been reset")

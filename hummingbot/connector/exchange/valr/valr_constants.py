@@ -28,6 +28,7 @@ ACCOUNTS_PATH_URL = "/v1/account/balances"
 MY_TRADES_PATH_URL = "/v1/account/transactionhistory"
 ORDER_PATH_URL = "/v1/orders/{}"
 PLACE_ORDER_PATH_URL = "/v1/orders/limit"
+PLACE_MARKET_ORDER_PATH_URL = "/v1/orders/market"
 CANCEL_ORDER_PATH_URL = "/v1/orders/order"
 CANCEL_ALL_ORDERS_PATH_URL = "/v1/orders/limit/cancel"
 ORDER_STATUS_PATH_URL = "/v1/orders/{}/detailed"
@@ -38,6 +39,7 @@ POSITION_INFORMATION_PATH_URL = "/v1/account/balances"
 ACCOUNT_INFO_PATH_URL = "/v1/account/info"
 ORDER_MODIFY_PATH_URL = "/v1/orders/modify"
 ORDER_HISTORY_PATH_URL = "/v1/orders/history"
+BATCH_ORDERS_PATH_URL = "/v1/batch/orders"
 
 # WebSocket event types
 WS_CONNECTION_EVENT = "WS_CONNECTION"
@@ -60,16 +62,30 @@ WS_CANCEL_ON_DISCONNECT_EVENT = "CANCEL_ON_DISCONNECT"
 WS_PLACE_LIMIT_ORDER_EVENT = "PLACE_LIMIT_ORDER"
 WS_PLACE_MARKET_ORDER_EVENT = "PLACE_MARKET_ORDER"
 WS_PLACE_CANCEL_ORDER_EVENT = "CANCEL_ORDER"
+WS_MODIFY_ORDER_EVENT = "MODIFY_ORDER"
+WS_BATCH_ORDERS_EVENT = "BATCH_ORDERS"
 WS_ORDER_RESPONSE_EVENT = "ORDER_PLACED"
 WS_ORDER_FAILED_EVENT = "ORDER_FAILED"
+WS_ORDER_PROCESSED_EVENT = "ORDER_PROCESSED"
+WS_MODIFY_ORDER_OUTCOME_EVENT = "MODIFY_ORDER_OUTCOME"
 
-# Timeouts
+# WebSocket market data event types (HFT optimized)
+WS_OB_L1_DIFF_EVENT = "OB_L1_DIFF"  # Rapid order book updates
+WS_MARKET_ORDERBOOK_UPDATE_EVENT = "MARKET_ORDERBOOK_UPDATE"
+
+# Timeouts - Optimized for HFT
 MESSAGE_TIMEOUT = 30.0
 PING_TIMEOUT = 5.0  # Reduced for faster connection issue detection in HFT
 API_CALL_TIMEOUT = 10.0
 API_MAX_RETRIES = 4
 READY_STATE_TIMEOUT = 60.0  # Maximum time to wait for connector to reach ready state
 SYMBOL_MAPPING_TIMEOUT = 30.0  # Maximum time to wait for symbol mapping initialization
+
+# HFT-specific timeouts
+WS_ORDER_TIMEOUT = 1.0  # Aggressive timeout for WebSocket order placement
+WS_ORDER_MODIFY_TIMEOUT = 1.0  # Timeout for order modifications
+WS_BATCH_ORDER_TIMEOUT = 2.0  # Slightly longer for batch operations
+REST_ORDER_TIMEOUT = 5.0  # Fallback REST timeout
 
 # Connection Health Monitoring
 CONNECTION_HEALTH_CHECK_INTERVAL = 60.0  # Check connection health every 60 seconds
@@ -98,35 +114,53 @@ ORDER_STATE = {
     "Rejected": OrderState.FAILED,
 }
 
-# Rate Limits - Conservative values to prevent HTTP 429 errors
-# Based on observed 429 rate limit errors, using very conservative limits
+# Rate Limits - Optimized for HFT based on VALR's actual API limits
+# VALR API Limits:
+# - General: 1000 calls/min per API key, 1200 calls/min per IP
+# - HFT Per-Second Limits: 400/s for orders, 450/s for cancellations
+# - WebSocket: 30 new connections/min
 NO_LIMIT = 1000000  # Used for endpoints without explicit limits
+
+# Helper to convert per-minute to per-second limits with safety margin
+def per_minute_limit(limit_per_min, safety_factor=0.9):
+    """Convert per-minute limit to per-second with safety margin"""
+    return int((limit_per_min / 60) * safety_factor)
+
 RATE_LIMITS = [
-    # Public endpoints - Very conservative to prevent 429 errors during initialization
-    RateLimit(limit_id=TICKER_PRICE_PATH_URL, limit=2, time_interval=1),
-    RateLimit(limit_id=EXCHANGE_INFO_PATH_URL, limit=1, time_interval=2),  # Critical for initialization
-    RateLimit(limit_id=SNAPSHOT_PATH_URL, limit=5, time_interval=1),
-    RateLimit(limit_id=SERVER_TIME_PATH_URL, limit=1, time_interval=3),   # Critical for time sync
-    RateLimit(limit_id=PING_PATH_URL, limit=1, time_interval=2),
-    RateLimit(limit_id=PAIRS_PATH_URL, limit=1, time_interval=5),         # Critical for symbol mapping
-    # Private endpoints - Reduced limits to prevent 429 errors  
-    RateLimit(limit_id=ACCOUNTS_PATH_URL, limit=5, time_interval=1),
-    RateLimit(limit_id=MY_TRADES_PATH_URL, limit=5, time_interval=1),
-    RateLimit(limit_id=ORDER_PATH_URL, limit=10, time_interval=1),
-    RateLimit(limit_id=PLACE_ORDER_PATH_URL, limit=20, time_interval=1),
-    RateLimit(limit_id=CANCEL_ORDER_PATH_URL, limit=20, time_interval=1),
-    RateLimit(limit_id=CANCEL_ALL_ORDERS_PATH_URL, limit=2, time_interval=1),
-    RateLimit(limit_id=ORDER_STATUS_PATH_URL, limit=10, time_interval=1),
-    RateLimit(limit_id=USER_STREAM_PATH_URL, limit=1, time_interval=5),
-    RateLimit(limit_id=SET_LEVERAGE_PATH_URL, limit=1, time_interval=2),
-    RateLimit(limit_id=GET_INCOME_HISTORY_PATH_URL, limit=5, time_interval=1),
-    RateLimit(limit_id=POSITION_INFORMATION_PATH_URL, limit=5, time_interval=1),
-    RateLimit(limit_id=ACCOUNT_INFO_PATH_URL, limit=2, time_interval=1),
-    RateLimit(limit_id=ORDER_MODIFY_PATH_URL, limit=10, time_interval=1),
-    RateLimit(limit_id=ORDER_HISTORY_PATH_URL, limit=5, time_interval=1),
-    # WebSocket connections - Much more conservative to prevent 429 handshake errors
-    RateLimit(limit_id=WSS_ACCOUNT_URL, limit=1, time_interval=120),      # Very conservative
-    RateLimit(limit_id=WSS_TRADE_URL, limit=1, time_interval=120),        # Very conservative
+    # Public endpoints - Balanced for stability and performance
+    RateLimit(limit_id=TICKER_PRICE_PATH_URL, limit=per_minute_limit(200), time_interval=1),
+    RateLimit(limit_id=EXCHANGE_INFO_PATH_URL, limit=per_minute_limit(60), time_interval=1),
+    RateLimit(limit_id=SNAPSHOT_PATH_URL, limit=per_minute_limit(300), time_interval=1),
+    RateLimit(limit_id=SERVER_TIME_PATH_URL, limit=per_minute_limit(60), time_interval=1),
+    RateLimit(limit_id=PING_PATH_URL, limit=per_minute_limit(60), time_interval=1),
+    RateLimit(limit_id=PAIRS_PATH_URL, limit=per_minute_limit(60), time_interval=1),
+    
+    # Private endpoints - Optimized for HFT with VALR's actual limits
+    RateLimit(limit_id=ACCOUNTS_PATH_URL, limit=per_minute_limit(300), time_interval=1),
+    RateLimit(limit_id=MY_TRADES_PATH_URL, limit=per_minute_limit(300), time_interval=1),
+    RateLimit(limit_id=ORDER_PATH_URL, limit=per_minute_limit(600), time_interval=1),
+    
+    # HFT-critical endpoints with per-second limits
+    RateLimit(limit_id=PLACE_ORDER_PATH_URL, limit=400, time_interval=1),  # 400/s actual limit
+    RateLimit(limit_id=CANCEL_ORDER_PATH_URL, limit=450, time_interval=1),  # 450/s actual limit
+    RateLimit(limit_id=ORDER_MODIFY_PATH_URL, limit=400, time_interval=1),  # 400/s actual limit
+    
+    # Batch operations
+    RateLimit(limit_id=BATCH_ORDERS_PATH_URL, limit=400, time_interval=1),  # 400/s for batch orders
+    RateLimit(limit_id=CANCEL_ALL_ORDERS_PATH_URL, limit=50, time_interval=1),
+    
+    # Status and info endpoints
+    RateLimit(limit_id=ORDER_STATUS_PATH_URL, limit=per_minute_limit(600), time_interval=1),
+    RateLimit(limit_id=USER_STREAM_PATH_URL, limit=per_minute_limit(60), time_interval=1),
+    RateLimit(limit_id=SET_LEVERAGE_PATH_URL, limit=per_minute_limit(60), time_interval=1),
+    RateLimit(limit_id=GET_INCOME_HISTORY_PATH_URL, limit=per_minute_limit(300), time_interval=1),
+    RateLimit(limit_id=POSITION_INFORMATION_PATH_URL, limit=per_minute_limit(300), time_interval=1),
+    RateLimit(limit_id=ACCOUNT_INFO_PATH_URL, limit=per_minute_limit(120), time_interval=1),
+    RateLimit(limit_id=ORDER_HISTORY_PATH_URL, limit=per_minute_limit(300), time_interval=1),
+    
+    # WebSocket connections - 30/min as per VALR docs
+    RateLimit(limit_id=WSS_ACCOUNT_URL, limit=1, time_interval=2),  # Max 30/min
+    RateLimit(limit_id=WSS_TRADE_URL, limit=1, time_interval=2),    # Max 30/min
 ]
 
 # WebSocket connection limits

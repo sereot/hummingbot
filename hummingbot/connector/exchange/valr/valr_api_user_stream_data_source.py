@@ -1,9 +1,10 @@
 import asyncio
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from hummingbot.connector.exchange.valr import valr_constants as CONSTANTS, valr_web_utils as web_utils
 from hummingbot.connector.exchange.valr.valr_auth import ValrAuth
+from hummingbot.connector.exchange.valr.valr_connection_pool import VALRConnectionPool
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
@@ -36,6 +37,10 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
         self._domain = domain
         self._last_recv_time: float = 0  # Track last received time for REST fallback mode
         self._ws_assistant: WSAssistant | None = None  # Store WebSocket assistant reference
+        
+        # Connection pool for HFT optimization
+        self._connection_pool: Optional[VALRConnectionPool] = None
+        self._use_connection_pool = True  # Enable by default for HFT
         
         # Connection health monitoring
         self._connection_health = {
@@ -221,12 +226,30 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """
         Creates an authenticated connection to the user account WebSocket with rate limiting support.
-        According to VALR WebSocket API documentation, authentication is done via connection headers,
-        and the account WebSocket automatically subscribes to all account events upon connection.
+        Uses connection pool for HFT optimization if enabled.
         
         Returns:
             An authenticated WSAssistant instance
         """
+        # Use connection pool if enabled
+        if self._use_connection_pool:
+            if self._connection_pool is None:
+                # Initialize connection pool
+                self._connection_pool = VALRConnectionPool(
+                    ws_factory=self._api_factory.get_ws_assistant,
+                    ws_url=CONSTANTS.WSS_ACCOUNT_URL,
+                    pool_size=3,
+                    rotation_interval=25.0  # Rotate before VALR's 30s disconnect
+                )
+                await self._connection_pool.initialize()
+                self.logger().info("Initialized connection pool for user stream")
+            
+            # Get connection from pool
+            ws_assistant = await self._connection_pool.get_connection()
+            self.logger().debug("Using pooled connection for user stream")
+            return ws_assistant
+        
+        # Fallback to single connection
         ws_assistant = await self._api_factory.get_ws_assistant()
         
         # Connect to account WebSocket with retry logic for rate limiting
@@ -480,13 +503,25 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
         """
         self.logger().warning("User stream interrupted. Cleaning up and attempting reconnection...")
         
-        # Disconnect the websocket if it exists
-        if websocket_assistant is not None:
+        # Don't disconnect if using connection pool (pool manages connections)
+        if not self._use_connection_pool and websocket_assistant is not None:
             await websocket_assistant.disconnect()
-            self._ws_assistant = None  # Clear the reference
+            
+        self._ws_assistant = None  # Clear the reference
         
         # Additional cleanup can be added here if needed
         # The framework will automatically attempt to reconnect
+    
+    async def stop(self):
+        """Stop the user stream data source and clean up resources."""
+        # Shutdown connection pool if used
+        if self._connection_pool is not None:
+            await self._connection_pool.shutdown()
+            self._connection_pool = None
+        
+        # Call parent stop method if exists
+        if hasattr(super(), 'stop'):
+            await super().stop()
     
     async def _enable_cancel_on_disconnect(self, websocket_assistant: WSAssistant):
         """

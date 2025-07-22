@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from hummingbot.connector.exchange.valr import valr_constants as CONSTANTS, valr_web_utils as web_utils
+from hummingbot.connector.exchange.valr.valr_l1_order_book_optimizer import VALRL1OrderBookOptimizer
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.core.data_type.order_book_message import OrderBookMessage, OrderBookMessageType
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
@@ -82,6 +83,14 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
             'total_uptime': 0,  # Total connection uptime
             'disconnect_pattern': []  # Track disconnect intervals for pattern analysis
         }
+        
+        # Initialize L1 order book optimizer for ultra-low latency access
+        self._l1_optimizer = VALRL1OrderBookOptimizer(max_cache_size=1000)
+
+    @property
+    def l1_optimizer(self) -> VALRL1OrderBookOptimizer:
+        """Get the L1 order book optimizer for ultra-fast best bid/ask access."""
+        return self._l1_optimizer
 
     async def get_last_traded_prices(
         self, trading_pairs: list[str], domain: str | None = None
@@ -149,7 +158,8 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
             "AGGREGATED_ORDERBOOK_UPDATE", 
             "FULL_ORDERBOOK_SNAPSHOT",
             "FULL_ORDERBOOK_UPDATE",
-            "MARKET_SUMMARY_UPDATE"
+            "MARKET_SUMMARY_UPDATE",
+            "OB_L1_DIFF"
         }
         
         return message_type in known_types
@@ -167,7 +177,7 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
         # Update type-specific counters
         if message_type == "NEW_TRADE":
             self._message_stats['trade_messages'] += 1
-        elif message_type == "AGGREGATED_ORDERBOOK_UPDATE":
+        elif message_type in ["AGGREGATED_ORDERBOOK_UPDATE", "OB_L1_DIFF"]:
             self._message_stats['diff_messages'] += 1
         elif message_type in ["FULL_ORDERBOOK_SNAPSHOT", "FULL_ORDERBOOK_UPDATE"]:
             self._message_stats['snapshot_messages'] += 1
@@ -572,13 +582,24 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 }]
             })
             
+            # Subscribe to L1 diff updates for ultra-low latency order book updates
+            # OB_L1_DIFF provides rapid best bid/ask updates for HFT
+            l1_diff_subscribe_request = WSJSONRequest({
+                "type": "SUBSCRIBE",
+                "subscriptions": [{
+                    "event": "OB_L1_DIFF",
+                    "pairs": exchange_pairs
+                }]
+            })
+            
             # Send all subscription requests
             await ws.send(orderbook_subscribe_request)
             await ws.send(trade_subscribe_request) 
             await ws.send(market_summary_subscribe_request)
+            await ws.send(l1_diff_subscribe_request)
             
             self.logger().info(f"Subscribed to Trade WebSocket channels for {len(exchange_pairs)} pairs: "
-                             f"AGGREGATED_ORDERBOOK_UPDATE, NEW_TRADE, MARKET_SUMMARY_UPDATE")
+                             f"AGGREGATED_ORDERBOOK_UPDATE, NEW_TRADE, MARKET_SUMMARY_UPDATE, OB_L1_DIFF")
             
         except asyncio.CancelledError:
             raise
@@ -605,7 +626,7 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
         
         if event_type == "NEW_TRADE":
             channel = self._trade_messages_queue_key
-        elif event_type == "AGGREGATED_ORDERBOOK_UPDATE":
+        elif event_type in ["AGGREGATED_ORDERBOOK_UPDATE", "OB_L1_DIFF"]:
             channel = self._diff_messages_queue_key
         elif event_type == "FULL_ORDERBOOK_SNAPSHOT":
             channel = self._snapshot_messages_queue_key
@@ -659,6 +680,82 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
             
         except Exception:
             self.logger().exception("Error processing trade message")
+
+    async def _parse_l1_diff_message(self, raw_message: dict[str, Any], message_queue: asyncio.Queue):
+        """
+        Parse OB_L1_DIFF messages for ultra-low latency order book updates.
+        OB_L1_DIFF provides rapid updates of the best bid and ask prices/quantities.
+        
+        Args:
+            raw_message: The JSON dictionary of the L1 diff event
+            message_queue: Queue where the parsed messages should be stored in
+        """
+        try:
+            # OB_L1_DIFF format: {"type": "OB_L1_DIFF", "currencyPairSymbol": "BTCZAR", "data": {...}}
+            pair = raw_message.get("currencyPairSymbol", "")
+            trading_pair = web_utils.convert_from_exchange_trading_pair(pair)
+            
+            if trading_pair not in self._trading_pairs:
+                return
+            
+            # Extract the data payload
+            data = raw_message.get("data", {})
+            
+            # L1 diff contains only the best bid and ask
+            # Format: {"bestBid": {"price": "100", "quantity": "1.5"}, "bestAsk": {"price": "101", "quantity": "2.0"}}
+            best_bid = data.get("bestBid", {})
+            best_ask = data.get("bestAsk", {})
+            
+            # Get sequence number if provided
+            sequence_number = data.get("SequenceNumber")
+            
+            # Update L1 optimizer for ultra-fast access
+            update_latency = self._l1_optimizer.update_l1_data(
+                trading_pair=trading_pair,
+                bid_data=best_bid,
+                ask_data=best_ask,
+                sequence_number=sequence_number
+            )
+            
+            # Log ultra-fast updates
+            if update_latency >= 0 and update_latency < 100:  # Less than 100 microseconds
+                self.logger().debug(f"Ultra-fast L1 update for {trading_pair}: {update_latency:.1f}μs")
+            
+            # Convert to standard format
+            bids = []
+            asks = []
+            
+            if best_bid:
+                bid_price = Decimal(best_bid.get("price", "0"))
+                bid_quantity = Decimal(best_bid.get("quantity", "0"))
+                if bid_price > 0 and bid_quantity > 0:
+                    bids.append([bid_price, bid_quantity])
+            
+            if best_ask:
+                ask_price = Decimal(best_ask.get("price", "0"))
+                ask_quantity = Decimal(best_ask.get("quantity", "0"))
+                if ask_price > 0 and ask_quantity > 0:
+                    asks.append([ask_price, ask_quantity])
+            
+            # Create diff message with L1 data
+            diff_msg = OrderBookMessage(
+                message_type=OrderBookMessageType.DIFF,
+                content={
+                    "trading_pair": trading_pair,
+                    "bids": bids,
+                    "asks": asks,
+                    "update_id": sequence_number or int(time.time() * 1e6),  # Use microsecond timestamp if no sequence
+                    "timestamp": time.time(),
+                    "is_l1_diff": True,  # Mark as L1 diff for special handling
+                    "update_latency_us": update_latency  # Include latency for monitoring
+                },
+                timestamp=time.time(),
+            )
+            
+            message_queue.put_nowait(diff_msg)
+            
+        except Exception:
+            self.logger().exception("Error processing L1 diff message")
 
     async def _parse_order_book_diff_message(self, raw_message: dict[str, Any], message_queue: asyncio.Queue):
         """
@@ -880,7 +977,11 @@ class ValrAPIOrderBookDataSource(OrderBookTrackerDataSource):
                             if channel == self._trade_messages_queue_key:
                                 await self._parse_trade_message(message_data, output)
                             elif channel == self._diff_messages_queue_key:
-                                await self._parse_order_book_diff_message(message_data, output)
+                                # Route based on message type
+                                if message_data.get("type") == "OB_L1_DIFF":
+                                    await self._parse_l1_diff_message(message_data, output)
+                                else:
+                                    await self._parse_order_book_diff_message(message_data, output)
                             elif channel in [self._snapshot_messages_queue_key]:
                                 await self._parse_order_book_snapshot_message(message_data, output)
                             
