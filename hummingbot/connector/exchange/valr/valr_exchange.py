@@ -866,20 +866,22 @@ class ValrExchange(ExchangePyBase):
         # Convert trading pair to VALR format
         valr_pair = web_utils.convert_to_exchange_trading_pair(tracked_order.trading_pair)
         
-        # Prepare WebSocket cancel message based on official Postman documentation
-        # CRITICAL: VALR uses "payload" field for request data (not "data")
-        # See docs/api/VALR_WEBSOCKET_CRITICAL_NOTES.md for details
+        # Prepare WebSocket cancel message
+        # The WSJSONRequest.payload is sent directly as the message
         cancel_message = WSJSONRequest(
             payload={
-                "type": CONSTANTS.WS_PLACE_CANCEL_ORDER_EVENT,
+                "type": "CANCEL_ORDER",
                 "clientMsgId": client_msg_id,
-                "payload": {  # VALR expects "payload" for request messages
+                "payload": {  # VALR expects "payload" for request data
                     "customerOrderId": order_id,
                     "pair": valr_pair
                 }
             }
             # Note: is_auth_required removed - VALR authenticates during WebSocket handshake only
         )
+        
+        # Log the cancel message for debugging
+        self.logger().debug(f"Sending WebSocket cancel message: {json.dumps(cancel_message.payload)}")
         
         # Create future for response tracking
         response_future = asyncio.Future()
@@ -1385,9 +1387,12 @@ class ValrExchange(ExchangePyBase):
         try:
             balances = event_message.get("data", {})
             
-            # Validate balances format
-            if not isinstance(balances, list):
-                self.logger().warning(f"Expected list for balance data, got {type(balances)}: {balances}")
+            # Handle both list and single dict format
+            if isinstance(balances, dict):
+                # VALR sometimes sends single balance update as dict
+                balances = [balances]
+            elif not isinstance(balances, list):
+                self.logger().warning(f"Unexpected balance data format: {type(balances)}")
                 return
             
             for currency_data in balances:

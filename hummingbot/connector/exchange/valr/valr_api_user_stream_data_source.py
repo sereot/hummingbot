@@ -466,7 +466,7 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                                        "CANCEL_ORDER_SUCCESS", "CANCEL_ORDER_FAILED",
                                        "MODIFY_ORDER_OUTCOME", "PLACE_LIMIT_WS_RESPONSE",
                                        "PLACE_MARKET_WS_RESPONSE", "CANCEL_ORDER_WS_RESPONSE",
-                                       "CANCEL_ORDER_RESPONSE"]:
+                                       "CANCEL_ORDER_RESPONSE", "ERROR"]:
                             # Try to find clientMsgId in message
                             client_msg_id = event_message.get("clientMsgId")
                             if not client_msg_id and isinstance(event_message.get("data"), dict):
@@ -484,6 +484,17 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                                 self.logger().warning(f"⚠️ No pending future for {msg_type} with clientMsgId: {client_msg_id}")
                                 self.logger().warning(f"Pending futures: {list(self._order_response_futures.keys())}")
                             else:
+                                # For messages without clientMsgId, try to match by customerOrderId
+                                if msg_type in ["ORDER_PROCESSED", "CANCEL_ORDER_SUCCESS", "CANCEL_ORDER_FAILED", "ERROR"]:
+                                    data = event_message.get("data", {})
+                                    customer_order_id = data.get("customerOrderId") if isinstance(data, dict) else None
+                                    
+                                    if customer_order_id:
+                                        # Try to match with any pending future that might be waiting for this order
+                                        # This is a fallback mechanism for VALR responses without clientMsgId
+                                        self.logger().debug(f"Attempting to match {msg_type} by customerOrderId: {customer_order_id}")
+                                        # For now, just log - actual matching would require storing customerOrderId mapping
+                                
                                 self.logger().warning(f"⚠️ Order response {msg_type} missing clientMsgId! Message: {event_message}")
                         
                         # Log received messages for debugging
