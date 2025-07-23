@@ -42,7 +42,7 @@ class ValrExchange(ExchangePyBase):
     
     # HFT-optimized poll intervals
     SHORT_POLL_INTERVAL = 1.0  # Reduced from 5.0 for HFT performance
-    LONG_POLL_INTERVAL = 10.0  # Reduced from 120.0 for HFT performance
+    LONG_POLL_INTERVAL = 1.0  # CRITICAL: Must be 1.0 for HFT! When WS works, we poll every second
 
     web_utils = web_utils
 
@@ -1403,6 +1403,9 @@ class ValrExchange(ExchangePyBase):
                 elif event_type == CONSTANTS.WS_USER_FAILED_CANCEL_EVENT:
                     self.logger().warning(f"Failed to cancel order: {event_message}")
                     
+                elif event_type == CONSTANTS.WS_USER_OPEN_ORDERS_UPDATE_EVENT:
+                    await self._process_open_orders_update(event_message)
+                    
                 elif event_type in [
                     CONSTANTS.WS_ORDER_RESPONSE_EVENT, 
                     CONSTANTS.WS_ORDER_FAILED_EVENT,
@@ -1571,6 +1574,41 @@ class ValrExchange(ExchangePyBase):
             
         except Exception:
             self.logger().exception("Error processing trade update")
+    
+    async def _process_open_orders_update(self, event_message: dict[str, Any]):
+        """Process OPEN_ORDERS_UPDATE to sync exchange order state with local tracking."""
+        try:
+            orders_data = event_message.get("data", [])
+            
+            # Get all active customer order IDs from the exchange
+            exchange_order_ids = set()
+            for order_data in orders_data:
+                customer_order_id = order_data.get("customerOrderId", "")
+                if customer_order_id:
+                    exchange_order_ids.add(customer_order_id)
+            
+            # Check our tracked orders
+            for client_order_id, tracked_order in list(self._order_tracker.all_orders.items()):
+                if tracked_order.is_done:
+                    continue
+                    
+                # If our order is not in the exchange's open orders list, it was cancelled/filled
+                if client_order_id not in exchange_order_ids:
+                    self.logger().info(f"Order {client_order_id} not found in exchange open orders - marking as cancelled")
+                    # Create cancellation update
+                    order_update = OrderUpdate(
+                        trading_pair=tracked_order.trading_pair,
+                        update_timestamp=self.current_timestamp,
+                        new_state=OrderState.CANCELED,
+                        client_order_id=client_order_id,
+                        exchange_order_id=tracked_order.exchange_order_id,
+                    )
+                    self._order_tracker.process_order_update(order_update)
+            
+            self.logger().debug(f"Processed OPEN_ORDERS_UPDATE - Exchange has {len(exchange_order_ids)} open orders")
+            
+        except Exception:
+            self.logger().exception("Error processing open orders update")
     
     async def _process_websocket_order_response(self, event_message: dict[str, Any]):
         """Process WebSocket order placement/modification response messages."""
