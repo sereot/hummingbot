@@ -787,6 +787,9 @@ class ValrExchange(ExchangePyBase):
             # Try WebSocket cancellation first if enabled and circuit breaker is not open
             if self._ws_order_placement_enabled and self._use_websocket_for_orders and ws_breaker.state != "open":
                 try:
+                    # Mark order as being cancelled to prevent race conditions
+                    tracked_order.is_being_cancelled = True
+                    
                     result = await self._cancel_order_websocket(order_id, tracked_order)
                     # WebSocket cancellation only sends the request, doesn't confirm cancellation
                     # We'll rely on ORDER_STATUS_UPDATE to confirm the actual cancellation
@@ -1402,6 +1405,8 @@ class ValrExchange(ExchangePyBase):
                     CONSTANTS.WS_USER_ORDER_DELETE_EVENT,
                     CONSTANTS.WS_USER_ORDER_CANCEL_EVENT,
                     CONSTANTS.WS_USER_INSTANT_ORDER_COMPLETED_EVENT,
+                    CONSTANTS.WS_CANCEL_ORDER_SUCCESS_EVENT,  # Handle successful cancellations
+                    CONSTANTS.WS_CANCEL_ORDER_FAILED_EVENT,   # Handle failed cancellations
                 ]:
                     await self._process_order_lifecycle_event(event_message)
                     
@@ -1412,14 +1417,14 @@ class ValrExchange(ExchangePyBase):
                     self.logger().warning(f"Failed to cancel order: {event_message}")
                     
                 elif event_type == CONSTANTS.WS_USER_OPEN_ORDERS_UPDATE_EVENT:
-                    # DISABLED: This handler was causing race conditions with order cancellations
-                    # await self._process_open_orders_update(event_message)
-                    pass
+                    # Re-enabled with improved race condition handling
+                    await self._process_open_orders_update(event_message)
                     
                 elif event_type in [
                     CONSTANTS.WS_ORDER_RESPONSE_EVENT, 
                     CONSTANTS.WS_ORDER_FAILED_EVENT,
-                    CONSTANTS.WS_MODIFY_ORDER_OUTCOME_EVENT
+                    CONSTANTS.WS_MODIFY_ORDER_OUTCOME_EVENT,
+                    CONSTANTS.WS_ORDER_PROCESSED_EVENT  # Handle ORDER_PROCESSED events
                 ]:
                     await self._process_websocket_order_response(event_message)
                     
@@ -1514,13 +1519,22 @@ class ValrExchange(ExchangePyBase):
             # Process the update
             self._order_tracker.process_order_update(order_update)
             
+            # Clear cancellation flag if order is cancelled
+            if order_state == OrderState.CANCELED and hasattr(tracked_order, 'is_being_cancelled'):
+                tracked_order.is_being_cancelled = False
+            
             # Log significant order lifecycle events
             if event_type == CONSTANTS.WS_USER_NEW_ORDER_EVENT:
                 self.logger().info(f"Order placed successfully: {client_order_id}")
             elif event_type == CONSTANTS.WS_USER_ORDER_CANCEL_EVENT:
                 self.logger().info(f"Order cancelled: {client_order_id}")
+            elif event_type == CONSTANTS.WS_CANCEL_ORDER_SUCCESS_EVENT:
+                self.logger().info(f"Order cancellation confirmed: {client_order_id}")
+            elif event_type == CONSTANTS.WS_CANCEL_ORDER_FAILED_EVENT:
+                reason = order_data.get("reason", "Unknown")
+                self.logger().warning(f"Order cancellation failed - {client_order_id}: {reason}")
             elif event_type == CONSTANTS.WS_USER_ORDER_STATUS_UPDATE_EVENT:
-                status = order_data.get("status", "Unknown")
+                status = order_data.get("orderStatusType", "Unknown")
                 self.logger().info(f"Order status update - {client_order_id}: {status}")
             elif event_type == CONSTANTS.WS_USER_INSTANT_ORDER_COMPLETED_EVENT:
                 self.logger().info(f"Order completed: {client_order_id}")
@@ -1536,6 +1550,11 @@ class ValrExchange(ExchangePyBase):
             return OrderState.OPEN
         elif event_type == CONSTANTS.WS_USER_ORDER_CANCEL_EVENT:
             return OrderState.CANCELED
+        elif event_type == CONSTANTS.WS_CANCEL_ORDER_SUCCESS_EVENT:
+            return OrderState.CANCELED
+        elif event_type == CONSTANTS.WS_CANCEL_ORDER_FAILED_EVENT:
+            # Cancel failed, order is still open
+            return OrderState.OPEN
         elif event_type == CONSTANTS.WS_USER_ORDER_DELETE_EVENT:
             return OrderState.CANCELED
         elif event_type == CONSTANTS.WS_USER_INSTANT_ORDER_COMPLETED_EVENT:
@@ -1545,8 +1564,8 @@ class ValrExchange(ExchangePyBase):
             valr_status = order_data.get("orderStatusType", "")
             return CONSTANTS.ORDER_STATE.get(valr_status, OrderState.OPEN)
         elif event_type == CONSTANTS.WS_USER_ORDER_STATUS_UPDATE_EVENT:
-            # ORDER_STATUS_UPDATE uses "status" field, not "orderStatusType"
-            valr_status = order_data.get("status", "")
+            # ORDER_STATUS_UPDATE uses "orderStatusType" field, not "status" 
+            valr_status = order_data.get("orderStatusType", "")
             # Map VALR status to order state
             if valr_status == "Cancelled":
                 return OrderState.CANCELED
@@ -1554,10 +1573,13 @@ class ValrExchange(ExchangePyBase):
                 return OrderState.FILLED
             elif valr_status == "Partially Filled":
                 return OrderState.PARTIALLY_FILLED
-            elif valr_status in ["Placed", "Active"]:
+            elif valr_status in ["Placed", "Active", "Open"]:
                 return OrderState.OPEN
+            elif valr_status == "Failed":
+                return OrderState.FAILED
             else:
-                self.logger().warning(f"Unknown ORDER_STATUS_UPDATE status: {valr_status}")
+                # Log the full order data to debug unknown statuses
+                self.logger().warning(f"Unknown ORDER_STATUS_UPDATE status: {valr_status}, order_data: {order_data}")
                 return OrderState.OPEN
         
         # Default fallback
@@ -1610,28 +1632,43 @@ class ValrExchange(ExchangePyBase):
             
             # Get all active customer order IDs from the exchange
             exchange_order_ids = set()
+            exchange_orders_by_id = {}
+            
             for order_data in orders_data:
                 customer_order_id = order_data.get("customerOrderId", "")
                 if customer_order_id:
                     exchange_order_ids.add(customer_order_id)
+                    exchange_orders_by_id[customer_order_id] = order_data
             
-            self.logger().debug(f"OPEN_ORDERS_UPDATE - Exchange has {len(exchange_order_ids)} orders: {list(exchange_order_ids)[:5]}...")
+            self.logger().debug(f"OPEN_ORDERS_UPDATE - Exchange has {len(exchange_order_ids)} orders")
             
             # Check our tracked orders
             for client_order_id, tracked_order in list(self._order_tracker.all_orders.items()):
                 if tracked_order.is_done:
                     continue
+                
+                # Check if order is being cancelled
+                if hasattr(tracked_order, 'is_being_cancelled') and tracked_order.is_being_cancelled:
+                    self.logger().debug(f"Skipping order {client_order_id} - cancellation in progress")
+                    continue
                     
-                # Only mark as cancelled if order is older than 2 seconds to avoid race conditions
+                # Only process orders older than 5 seconds to avoid race conditions
                 order_age = self.current_timestamp - tracked_order.creation_timestamp
-                self.logger().debug(f"Order {client_order_id} - current_time: {self.current_timestamp}, creation_time: {tracked_order.creation_timestamp}, age: {order_age:.2f}s")
-                if order_age < 2.0:
+                if order_age < 5.0:
                     self.logger().debug(f"Skipping young order {client_order_id} (age: {order_age:.2f}s)")
-                    continue  # Skip young orders to avoid race conditions
+                    continue
                     
-                # If our order is not in the exchange's open orders list, it was cancelled/filled
+                # If our order is not in the exchange's open orders list
                 if client_order_id not in exchange_order_ids:
+                    # Double-check if we recently received a cancel confirmation
+                    if hasattr(tracked_order, 'last_update_timestamp'):
+                        time_since_update = self.current_timestamp - tracked_order.last_update_timestamp
+                        if time_since_update < 2.0:
+                            self.logger().debug(f"Skipping {client_order_id} - recently updated {time_since_update:.2f}s ago")
+                            continue
+                    
                     self.logger().info(f"Order {client_order_id} not found in exchange open orders (age: {order_age:.2f}s) - marking as cancelled")
+                    
                     # Create cancellation update
                     order_update = OrderUpdate(
                         trading_pair=tracked_order.trading_pair,
@@ -1641,8 +1678,21 @@ class ValrExchange(ExchangePyBase):
                         exchange_order_id=tracked_order.exchange_order_id,
                     )
                     self._order_tracker.process_order_update(order_update)
-            
-            self.logger().debug(f"Processed OPEN_ORDERS_UPDATE - Exchange has {len(exchange_order_ids)} open orders")
+                else:
+                    # Order exists on exchange - update its status if different
+                    exchange_order = exchange_orders_by_id[client_order_id]
+                    exchange_status = exchange_order.get("status", "")
+                    
+                    # Map exchange status to order state
+                    if exchange_status == "Placed" and tracked_order.current_state != OrderState.OPEN:
+                        order_update = OrderUpdate(
+                            trading_pair=tracked_order.trading_pair,
+                            update_timestamp=self.current_timestamp,
+                            new_state=OrderState.OPEN,
+                            client_order_id=client_order_id,
+                            exchange_order_id=tracked_order.exchange_order_id,
+                        )
+                        self._order_tracker.process_order_update(order_update)
             
         except Exception:
             self.logger().exception("Error processing open orders update")
@@ -1650,6 +1700,13 @@ class ValrExchange(ExchangePyBase):
     async def _process_websocket_order_response(self, event_message: dict[str, Any]):
         """Process WebSocket order placement/modification response messages."""
         try:
+            msg_type = event_message.get("type", "unknown")
+            
+            # Handle ORDER_PROCESSED separately as it doesn't have clientMsgId
+            if msg_type == CONSTANTS.WS_ORDER_PROCESSED_EVENT:
+                await self._handle_order_processed_event(event_message)
+                return
+            
             # Check for different types of message ID fields
             client_msg_id = event_message.get("clientMsgId") or event_message.get("messageId", "")
             
@@ -1661,11 +1718,64 @@ class ValrExchange(ExchangePyBase):
                     self.logger().debug(f"WebSocket order response processed: {client_msg_id}")
             else:
                 # Log different response types for debugging
-                msg_type = event_message.get("type", "unknown")
                 self.logger().debug(f"Received WebSocket {msg_type} response for unknown ID: {client_msg_id}")
                 
         except Exception:
             self.logger().exception("Error processing WebSocket order response")
+    
+    async def _handle_order_processed_event(self, event_message: dict[str, Any]):
+        """Handle ORDER_PROCESSED events which confirm order placement."""
+        try:
+            order_data = event_message.get("data", {})
+            
+            # Extract order identifiers
+            exchange_order_id = order_data.get("orderId", "")
+            client_order_id = order_data.get("customerOrderId", "")
+            success = order_data.get("success", False)
+            failure_reason = order_data.get("failureReason", "")
+            
+            if not client_order_id:
+                self.logger().warning(f"ORDER_PROCESSED event missing customerOrderId: {event_message}")
+                return
+                
+            # Find tracked order
+            tracked_order = self._order_tracker.all_orders.get(client_order_id)
+            if not tracked_order:
+                self.logger().warning(f"Received ORDER_PROCESSED for unknown order: {client_order_id}")
+                return
+            
+            if success:
+                # Update exchange order ID if not already set
+                if exchange_order_id and not tracked_order.exchange_order_id:
+                    tracked_order.update_exchange_order_id(exchange_order_id)
+                    
+                self.logger().info(f"Order {client_order_id} confirmed by exchange: {exchange_order_id}")
+                
+                # Create order update to confirm placement
+                order_update = OrderUpdate(
+                    trading_pair=tracked_order.trading_pair,
+                    update_timestamp=self.current_timestamp,
+                    new_state=OrderState.OPEN,
+                    client_order_id=client_order_id,
+                    exchange_order_id=exchange_order_id,
+                )
+                self._order_tracker.process_order_update(order_update)
+            else:
+                # Order failed
+                self.logger().warning(f"Order {client_order_id} failed: {failure_reason}")
+                
+                # Create order update for failure
+                order_update = OrderUpdate(
+                    trading_pair=tracked_order.trading_pair,
+                    update_timestamp=self.current_timestamp,
+                    new_state=OrderState.FAILED,
+                    client_order_id=client_order_id,
+                    exchange_order_id=exchange_order_id,
+                )
+                self._order_tracker.process_order_update(order_update)
+                
+        except Exception:
+            self.logger().exception("Error processing ORDER_PROCESSED event")
     
     def enable_websocket_order_placement(self):
         """Enable WebSocket order placement (for testing or when WebSocket is stable)."""
