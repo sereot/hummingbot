@@ -887,8 +887,8 @@ class ValrExchange(ExchangePyBase):
         valr_pair = web_utils.convert_to_exchange_trading_pair(tracked_order.trading_pair)
         
         # Prepare WebSocket cancel message
-        # The WSJSONRequest.payload is sent directly as the message
-        # CRITICAL: VALR expects "CANCEL_LIMIT_ORDER" not "CANCEL_ORDER"
+        # CRITICAL: WSJSONRequest.payload IS the message sent directly (no additional wrapping)
+        # VALR expects "CANCEL_LIMIT_ORDER" not "CANCEL_ORDER"
         cancel_message = WSJSONRequest(
             payload={
                 "type": "CANCEL_LIMIT_ORDER",  # Fixed: correct message type per VALR docs
@@ -898,7 +898,6 @@ class ValrExchange(ExchangePyBase):
                     "pair": valr_pair
                 }
             }
-            # Note: is_auth_required removed - VALR authenticates during WebSocket handshake only
         )
         
         # Log the cancel message for debugging
