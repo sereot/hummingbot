@@ -460,7 +460,8 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                                            "CANCEL_ORDER_SUCCESS", "CANCEL_ORDER_FAILED",
                                            "CANCEL_ORDER_WS_RESPONSE", "CANCEL_ORDER_RESPONSE",
                                            "CANCEL_LIMIT_ORDER_WS_RESPONSE",
-                                           "OPEN_ORDERS_UPDATE", "NEW_ACCOUNT_TRADE"]:
+                                           "OPEN_ORDERS_UPDATE", "NEW_ACCOUNT_TRADE",
+                                           "ORDER_STATUS_UPDATE"]:
                                 self.logger().info(f"Order-related message: {json.dumps(event_message, indent=2)}")
                         
                         if msg_type in ["ORDER_PLACED", "ORDER_FAILED", "ORDER_PROCESSED", 

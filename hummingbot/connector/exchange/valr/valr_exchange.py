@@ -788,7 +788,10 @@ class ValrExchange(ExchangePyBase):
             if self._ws_order_placement_enabled and self._use_websocket_for_orders and ws_breaker.state != "open":
                 try:
                     result = await self._cancel_order_websocket(order_id, tracked_order)
+                    # WebSocket cancellation only sends the request, doesn't confirm cancellation
+                    # We'll rely on ORDER_STATUS_UPDATE to confirm the actual cancellation
                     success = True
+                    # Don't mark as cancelled here - wait for ORDER_STATUS_UPDATE
                     return result
                 except CircuitOpenError as e:
                     self.logger().warning(f"WebSocket circuit breaker OPEN, falling back to REST: {e}")
@@ -930,8 +933,12 @@ class ValrExchange(ExchangePyBase):
             # VALR returns CANCEL_ORDER_WS_RESPONSE for WebSocket cancellations
             if response.get("type") == "CANCEL_ORDER_WS_RESPONSE":
                 response_data = response.get("data", {})
+                # IMPORTANT: "requested": true only means the cancel was accepted, not completed
+                # We need to wait for ORDER_STATUS_UPDATE to confirm actual cancellation
                 if response_data.get("requested", False):
-                    self.logger().info(f"Successfully cancelled order {order_id} via WebSocket")
+                    self.logger().info(f"Cancel request accepted for order {order_id} - waiting for confirmation")
+                    # Don't mark as cancelled yet - wait for ORDER_STATUS_UPDATE
+                    # For now, return success but the order tracker should wait for status update
                     return response
                 else:
                     raise Exception(f"Order cancellation not requested: {response}")
@@ -1391,6 +1398,7 @@ class ValrExchange(ExchangePyBase):
                 elif event_type in [
                     CONSTANTS.WS_USER_NEW_ORDER_EVENT,
                     CONSTANTS.WS_USER_ORDER_UPDATE_EVENT,
+                    CONSTANTS.WS_USER_ORDER_STATUS_UPDATE_EVENT,  # Handle ORDER_STATUS_UPDATE
                     CONSTANTS.WS_USER_ORDER_DELETE_EVENT,
                     CONSTANTS.WS_USER_ORDER_CANCEL_EVENT,
                     CONSTANTS.WS_USER_INSTANT_ORDER_COMPLETED_EVENT,
@@ -1511,6 +1519,9 @@ class ValrExchange(ExchangePyBase):
                 self.logger().info(f"Order placed successfully: {client_order_id}")
             elif event_type == CONSTANTS.WS_USER_ORDER_CANCEL_EVENT:
                 self.logger().info(f"Order cancelled: {client_order_id}")
+            elif event_type == CONSTANTS.WS_USER_ORDER_STATUS_UPDATE_EVENT:
+                status = order_data.get("status", "Unknown")
+                self.logger().info(f"Order status update - {client_order_id}: {status}")
             elif event_type == CONSTANTS.WS_USER_INSTANT_ORDER_COMPLETED_EVENT:
                 self.logger().info(f"Order completed: {client_order_id}")
             
@@ -1533,6 +1544,21 @@ class ValrExchange(ExchangePyBase):
             # Use status from order data for updates
             valr_status = order_data.get("orderStatusType", "")
             return CONSTANTS.ORDER_STATE.get(valr_status, OrderState.OPEN)
+        elif event_type == CONSTANTS.WS_USER_ORDER_STATUS_UPDATE_EVENT:
+            # ORDER_STATUS_UPDATE uses "status" field, not "orderStatusType"
+            valr_status = order_data.get("status", "")
+            # Map VALR status to order state
+            if valr_status == "Cancelled":
+                return OrderState.CANCELED
+            elif valr_status == "Filled":
+                return OrderState.FILLED
+            elif valr_status == "Partially Filled":
+                return OrderState.PARTIALLY_FILLED
+            elif valr_status in ["Placed", "Active"]:
+                return OrderState.OPEN
+            else:
+                self.logger().warning(f"Unknown ORDER_STATUS_UPDATE status: {valr_status}")
+                return OrderState.OPEN
         
         # Default fallback
         return OrderState.OPEN
