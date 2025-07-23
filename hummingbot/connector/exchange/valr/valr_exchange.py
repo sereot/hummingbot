@@ -38,7 +38,11 @@ if TYPE_CHECKING:
 
 
 class ValrExchange(ExchangePyBase):
-    UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
+    UPDATE_ORDER_STATUS_MIN_INTERVAL = 1.0  # Reduced from 10.0 for HFT performance
+    
+    # HFT-optimized poll intervals
+    SHORT_POLL_INTERVAL = 1.0  # Reduced from 5.0 for HFT performance
+    LONG_POLL_INTERVAL = 10.0  # Reduced from 120.0 for HFT performance
 
     web_utils = web_utils
 

@@ -104,7 +104,7 @@ ADAPTIVE_DELAY_MIN = 0.1  # Minimum adaptive reconnection delay (optimized for H
 ONE_HOUR = 60 * 60
 DIFF_STREAM_INTERVAL = 1.0  
 TRADE_STREAM_INTERVAL = 1.0
-UPDATE_ORDER_STATUS_INTERVAL = 10.0
+UPDATE_ORDER_STATUS_INTERVAL = 1.0  # Reduced from 10.0 for HFT performance
 USER_STREAM_PING_INTERVAL = 20.0  # VALR disconnects after ~30s without activity
 
 # Order States Mapping
