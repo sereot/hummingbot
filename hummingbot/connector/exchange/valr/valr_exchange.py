@@ -676,12 +676,14 @@ class ValrExchange(ExchangePyBase):
                 order_data["postOnly"] = order_type == OrderType.LIMIT_MAKER
                 order_data["timeInForce"] = "GTC"  # Good Till Cancelled
             
-            # VALR WebSocket order format based on working test script
+            # VALR WebSocket order format based on official Postman documentation
+            # CRITICAL: VALR uses "payload" field for request data (not "data")
+            # See docs/api/VALR_WEBSOCKET_CRITICAL_NOTES.md for details
             order_message = WSJSONRequest(
                 payload={
                     "type": CONSTANTS.WS_PLACE_LIMIT_ORDER_EVENT if order_type in (OrderType.LIMIT, OrderType.LIMIT_MAKER) else CONSTANTS.WS_PLACE_MARKET_ORDER_EVENT,
                     "clientMsgId": client_msg_id,
-                    "payload": order_data  # VALR expects "payload" for the order details
+                    "payload": order_data  # VALR expects "payload" for request messages
                 }
                 # Note: is_auth_required removed - VALR authenticates during WebSocket handshake only
             )
@@ -864,12 +866,14 @@ class ValrExchange(ExchangePyBase):
         # Convert trading pair to VALR format
         valr_pair = web_utils.convert_to_exchange_trading_pair(tracked_order.trading_pair)
         
-        # Prepare WebSocket cancel message based on working test script
+        # Prepare WebSocket cancel message based on official Postman documentation
+        # CRITICAL: VALR uses "payload" field for request data (not "data")
+        # See docs/api/VALR_WEBSOCKET_CRITICAL_NOTES.md for details
         cancel_message = WSJSONRequest(
             payload={
                 "type": CONSTANTS.WS_PLACE_CANCEL_ORDER_EVENT,
                 "clientMsgId": client_msg_id,
-                "payload": {  # VALR expects "payload" for the cancel details
+                "payload": {  # VALR expects "payload" for request messages
                     "customerOrderId": order_id,
                     "pair": valr_pair
                 }
