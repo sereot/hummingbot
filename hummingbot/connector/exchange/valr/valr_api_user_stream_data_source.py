@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 import json
 import time
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -238,6 +240,33 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
             'disconnect_pattern_established': len(self._connection_health['disconnect_pattern']) >= 3
         }
 
+    def _get_ws_auth_headers(self) -> Dict[str, str]:
+        """
+        Generate authentication headers for WebSocket connection.
+        VALR requires authentication during the WebSocket handshake.
+        
+        Returns:
+            Dictionary containing authentication headers
+        """
+        timestamp = int(time.time() * 1000)
+        path = "/ws/account"
+        
+        # Create signature payload: timestamp + GET + path
+        payload = f"{timestamp}GET{path}"
+        
+        # Generate HMAC SHA512 signature
+        signature = hmac.new(
+            self._auth.api_secret.encode('utf-8'),
+            payload.encode('utf-8'),
+            hashlib.sha512
+        ).hexdigest()
+        
+        return {
+            "X-VALR-API-KEY": self._auth.api_key,
+            "X-VALR-SIGNATURE": signature,
+            "X-VALR-TIMESTAMP": str(timestamp)
+        }
+
     async def _connected_websocket_assistant(self) -> WSAssistant:
         """
         Creates an authenticated connection to the user account WebSocket with rate limiting support.
@@ -279,9 +308,13 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
         
         for attempt in range(max_retries):
             try:
+                # Generate authentication headers for WebSocket connection
+                auth_headers = self._get_ws_auth_headers()
+                
                 await ws_assistant.connect(
                     ws_url=ws_url,
-                    ping_timeout=self.PING_TIMEOUT
+                    ping_timeout=self.PING_TIMEOUT,
+                    ws_headers=auth_headers  # Pass auth headers during connection
                 )
                 return  # Success
                 
