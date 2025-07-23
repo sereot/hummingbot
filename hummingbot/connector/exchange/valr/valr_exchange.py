@@ -845,32 +845,53 @@ class ValrExchange(ExchangePyBase):
                 self.logger().error(f"Failed to cancel order {order_id}: {error_msg}")
                 raise
     
+    async def _get_ws_assistant(self, operation: str = "operation"):
+        """Get WebSocket assistant with readiness check."""
+        if not hasattr(self, '_user_stream_tracker') or not self._user_stream_tracker:
+            raise Exception(f"User stream tracker not available for WebSocket {operation}")
+        
+        user_stream_data_source = self._user_stream_tracker.data_source
+        
+        # Check if WebSocket is connected and ready
+        max_wait_time = 5.0  # Maximum 5 seconds wait
+        wait_interval = 0.1  # Check every 100ms
+        waited = 0.0
+        
+        while waited < max_wait_time:
+            if (hasattr(user_stream_data_source, '_ws_assistant') and 
+                user_stream_data_source._ws_assistant and
+                hasattr(user_stream_data_source._ws_assistant, '_connection') and
+                user_stream_data_source._ws_assistant._connection and
+                hasattr(user_stream_data_source._ws_assistant._connection, 'connected') and
+                user_stream_data_source._ws_assistant._connection.connected):
+                return user_stream_data_source._ws_assistant
+            
+            if waited == 0:
+                self.logger().debug(f"Waiting for WebSocket to be ready for {operation}...")
+            
+            await asyncio.sleep(wait_interval)
+            waited += wait_interval
+        
+        raise Exception(f"WebSocket assistant not available for {operation} after {max_wait_time}s wait")
+    
     async def _cancel_order_websocket(self, order_id: str, tracked_order: InFlightOrder):
         """Cancel order via WebSocket."""
         # Generate unique client message ID for correlation
         client_msg_id = str(uuid.uuid4())
         
-        # Get WebSocket assistant from user stream data source
-        if not hasattr(self, '_user_stream_tracker') or not self._user_stream_tracker:
-            raise Exception("User stream tracker not available for WebSocket order cancellation")
-        
+        # Get WebSocket assistant with readiness check
+        ws_assistant = await self._get_ws_assistant("order cancellation")
         user_stream_data_source = self._user_stream_tracker.data_source
-        if not hasattr(user_stream_data_source, '_ws_assistant') or not user_stream_data_source._ws_assistant:
-            # Wait a bit for WebSocket to be ready
-            await asyncio.sleep(0.5)
-            if not hasattr(user_stream_data_source, '_ws_assistant') or not user_stream_data_source._ws_assistant:
-                raise Exception("WebSocket assistant not available for order cancellation")
-        
-        ws_assistant = user_stream_data_source._ws_assistant
         
         # Convert trading pair to VALR format
         valr_pair = web_utils.convert_to_exchange_trading_pair(tracked_order.trading_pair)
         
         # Prepare WebSocket cancel message
         # The WSJSONRequest.payload is sent directly as the message
+        # CRITICAL: VALR expects "CANCEL_LIMIT_ORDER" not "CANCEL_ORDER"
         cancel_message = WSJSONRequest(
             payload={
-                "type": "CANCEL_ORDER",
+                "type": "CANCEL_LIMIT_ORDER",  # Fixed: correct message type per VALR docs
                 "clientMsgId": client_msg_id,
                 "payload": {  # VALR expects "payload" for request data
                     "customerOrderId": order_id,
@@ -891,6 +912,10 @@ class ValrExchange(ExchangePyBase):
         user_stream_data_source.register_order_future(client_msg_id, response_future)
         
         try:
+            # DEBUG: Log the exact message being sent
+            self.logger().info(f"[DEBUG] Cancel message payload type: {type(cancel_message.payload)}")
+            self.logger().info(f"[DEBUG] Cancel message payload: {cancel_message.payload}")
+            
             # Send cancel message
             await ws_assistant.send(cancel_message)
             self.logger().debug(f"Sent WebSocket order cancellation: {client_msg_id}")
@@ -899,9 +924,14 @@ class ValrExchange(ExchangePyBase):
             response = await asyncio.wait_for(response_future, timeout=CONSTANTS.WS_ORDER_TIMEOUT)
             
             # Check if cancellation was successful
-            if response.get("type") == "CANCEL_ORDER_SUCCESS":
-                self.logger().info(f"Successfully cancelled order {order_id} via WebSocket")
-                return response
+            # VALR returns CANCEL_ORDER_WS_RESPONSE for WebSocket cancellations
+            if response.get("type") == "CANCEL_ORDER_WS_RESPONSE":
+                response_data = response.get("data", {})
+                if response_data.get("requested", False):
+                    self.logger().info(f"Successfully cancelled order {order_id} via WebSocket")
+                    return response
+                else:
+                    raise Exception(f"Order cancellation not requested: {response}")
             elif response.get("type") == "CANCEL_ORDER_FAILED":
                 error_msg = response.get("data", {}).get("message", "Unknown error")
                 raise Exception(f"Order cancellation failed: {error_msg}")
@@ -1402,13 +1432,13 @@ class ValrExchange(ExchangePyBase):
                         self.logger().warning(f"Invalid currency data format: {currency_data}")
                         continue
                     
-                    # Handle currency field - VALR returns it as a string, not a dict
+                    # Handle currency field - VALR can return it as either string or dict
                     currency_info = currency_data.get("currency")
                     if isinstance(currency_info, dict):
-                        # Handle nested currency object (future compatibility)
-                        asset = currency_info.get("currencyCode")
+                        # Handle nested currency object (WebSocket format)
+                        asset = currency_info.get("symbol") or currency_info.get("currencyCode")
                     elif isinstance(currency_info, str):
-                        # Handle direct currency string (VALR's actual format)
+                        # Handle direct currency string (REST format)
                         asset = currency_info
                     else:
                         self.logger().warning(f"Unknown currency format in balance data: {currency_data}")

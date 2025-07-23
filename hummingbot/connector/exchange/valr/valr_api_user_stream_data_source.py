@@ -459,6 +459,7 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                                            "PLACE_LIMIT_WS_RESPONSE", "PLACE_MARKET_WS_RESPONSE",
                                            "CANCEL_ORDER_SUCCESS", "CANCEL_ORDER_FAILED",
                                            "CANCEL_ORDER_WS_RESPONSE", "CANCEL_ORDER_RESPONSE",
+                                           "CANCEL_LIMIT_ORDER_WS_RESPONSE",
                                            "OPEN_ORDERS_UPDATE", "NEW_ACCOUNT_TRADE"]:
                                 self.logger().info(f"Order-related message: {json.dumps(event_message, indent=2)}")
                         
@@ -466,7 +467,7 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                                        "CANCEL_ORDER_SUCCESS", "CANCEL_ORDER_FAILED",
                                        "MODIFY_ORDER_OUTCOME", "PLACE_LIMIT_WS_RESPONSE",
                                        "PLACE_MARKET_WS_RESPONSE", "CANCEL_ORDER_WS_RESPONSE",
-                                       "CANCEL_ORDER_RESPONSE", "ERROR"]:
+                                       "CANCEL_ORDER_RESPONSE", "CANCEL_LIMIT_ORDER_WS_RESPONSE", "ERROR"]:
                             # Try to find clientMsgId in message
                             client_msg_id = event_message.get("clientMsgId")
                             if not client_msg_id and isinstance(event_message.get("data"), dict):
