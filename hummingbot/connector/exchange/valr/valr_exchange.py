@@ -1404,7 +1404,9 @@ class ValrExchange(ExchangePyBase):
                     self.logger().warning(f"Failed to cancel order: {event_message}")
                     
                 elif event_type == CONSTANTS.WS_USER_OPEN_ORDERS_UPDATE_EVENT:
-                    await self._process_open_orders_update(event_message)
+                    # DISABLED: This handler was causing race conditions with order cancellations
+                    # await self._process_open_orders_update(event_message)
+                    pass
                     
                 elif event_type in [
                     CONSTANTS.WS_ORDER_RESPONSE_EVENT, 
@@ -1587,14 +1589,23 @@ class ValrExchange(ExchangePyBase):
                 if customer_order_id:
                     exchange_order_ids.add(customer_order_id)
             
+            self.logger().debug(f"OPEN_ORDERS_UPDATE - Exchange has {len(exchange_order_ids)} orders: {list(exchange_order_ids)[:5]}...")
+            
             # Check our tracked orders
             for client_order_id, tracked_order in list(self._order_tracker.all_orders.items()):
                 if tracked_order.is_done:
                     continue
                     
+                # Only mark as cancelled if order is older than 2 seconds to avoid race conditions
+                order_age = self.current_timestamp - tracked_order.creation_timestamp
+                self.logger().debug(f"Order {client_order_id} - current_time: {self.current_timestamp}, creation_time: {tracked_order.creation_timestamp}, age: {order_age:.2f}s")
+                if order_age < 2.0:
+                    self.logger().debug(f"Skipping young order {client_order_id} (age: {order_age:.2f}s)")
+                    continue  # Skip young orders to avoid race conditions
+                    
                 # If our order is not in the exchange's open orders list, it was cancelled/filled
                 if client_order_id not in exchange_order_ids:
-                    self.logger().info(f"Order {client_order_id} not found in exchange open orders - marking as cancelled")
+                    self.logger().info(f"Order {client_order_id} not found in exchange open orders (age: {order_age:.2f}s) - marking as cancelled")
                     # Create cancellation update
                     order_update = OrderUpdate(
                         trading_pair=tracked_order.trading_pair,
