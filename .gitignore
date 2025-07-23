@@ -101,4 +101,5 @@ coverage.xml
 *credentials*.txt
 *api_key*.txt
 *secret*.txt
-test_credentials.txt
+# test_credentials.txt - Exception: tracked in repo as they are test-only credentials
+!test_credentials.txt

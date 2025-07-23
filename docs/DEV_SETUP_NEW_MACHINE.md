@@ -60,6 +60,8 @@ mkdir -p logs conf/connectors conf/strategies
 
 ## 4. Transfer Configuration Files
 
+**Note**: Test API credentials (`test_credentials.txt`) are now included in the repository for development convenience. These are test-only credentials with limited permissions.
+
 ### Option A: Manual Transfer (Recommended for sensitive data)
 
 ```bash
@@ -68,8 +70,7 @@ cd ~/hummingbot-private/hummingbot
 tar -czf ~/hummingbot-configs.tar.gz \
   conf/strategies/conf_pure_mm_*.yml \
   docs/sessions/ \
-  CLAUDE.md \
-  test_credentials.txt
+  CLAUDE.md
 
 # Transfer to new machine via secure method (SCP, USB, etc.)
 scp ~/hummingbot-configs.tar.gz user@newmachine:~/
@@ -118,19 +119,28 @@ git config --global core.autocrlf input
 
 ## 7. Restore VALR Credentials
 
+### Test Credentials (Available in Repository)
+Test API credentials are included in `test_credentials.txt` for development and testing:
+- **API Key**: 7a66934ebab38005a97641271a99ffaf95a01f85d3c70272673cb83713a70308
+- **Secret**: ab356d3d77b0f4b9d7c6ffa7399a073782fd7afbcb0d2c830bf868f6eeb8dde5
+- **Purpose**: Testing VALR connector functionality with limited permissions
+
+### Production Credentials
 ```bash
 # Create connectors config directory
 mkdir -p conf/connectors
 
-# Create valr_hft.yml (you'll need to add your API credentials)
+# Create valr_hft.yml (you'll need to add your PRODUCTION API credentials)
 cat > conf/connectors/valr_hft.yml << 'EOF'
-valr_api_key: YOUR_API_KEY_HERE
-valr_secret_key: YOUR_SECRET_KEY_HERE
+valr_api_key: YOUR_PRODUCTION_API_KEY_HERE
+valr_secret_key: YOUR_PRODUCTION_SECRET_KEY_HERE
 EOF
 
 # Set proper permissions
 chmod 600 conf/connectors/valr_hft.yml
 ```
+
+**Note**: Never commit production credentials. The test credentials in the repository are for development only.
 
 ## 8. Verify Everything Works
 
@@ -192,8 +202,8 @@ chmod +x ~/start-hummingbot-dev.sh
 Make sure these files exist on the new machine:
 - `CLAUDE.md` - Project instructions for Claude
 - `docs/sessions/*.md` - Session documentation
-- `conf/strategies/conf_pure_mm_8.yml` - Your working strategy
-- `test_credentials.txt` - VALR test credentials (if needed)
+- `conf/strategies/conf_pure_mm_8.yml` - Your working strategy (needs to be transferred)
+- `test_credentials.txt` - VALR test credentials (included in repository)
 
 ## 12. Cursor Tips for Seamless Transition
 
