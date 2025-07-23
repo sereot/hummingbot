@@ -676,14 +676,14 @@ class ValrExchange(ExchangePyBase):
                 order_data["postOnly"] = order_type == OrderType.LIMIT_MAKER
                 order_data["timeInForce"] = "GTC"  # Good Till Cancelled
             
-            # VALR expects "payload" not "data" for order placement
+            # VALR WebSocket order format based on working test script
             order_message = WSJSONRequest(
                 payload={
-                    "type": CONSTANTS.WS_PLACE_LIMIT_ORDER_EVENT if order_type == OrderType.LIMIT else CONSTANTS.WS_PLACE_MARKET_ORDER_EVENT,
+                    "type": CONSTANTS.WS_PLACE_LIMIT_ORDER_EVENT if order_type in (OrderType.LIMIT, OrderType.LIMIT_MAKER) else CONSTANTS.WS_PLACE_MARKET_ORDER_EVENT,
                     "clientMsgId": client_msg_id,
-                    "payload": order_data  # Changed from "data" to "payload"
-                },
-                is_auth_required=True  # Enable authentication for order placement
+                    "payload": order_data  # VALR expects "payload" for the order details
+                }
+                # Note: is_auth_required removed - VALR authenticates during WebSocket handshake only
             )
             
             # Create future for response tracking
@@ -694,6 +694,9 @@ class ValrExchange(ExchangePyBase):
             user_stream_data_source.register_order_future(client_msg_id, response_future)
             
             try:
+                # Log the full message being sent for debugging
+                self.logger().info(f"Sending WebSocket order message: {json.dumps(order_message.payload, indent=2)}")
+                
                 # Send order message
                 await ws_assistant.send(order_message)
                 self.logger().info(f"Sent WebSocket order placement: {client_msg_id} for {trading_pair} "
@@ -861,17 +864,17 @@ class ValrExchange(ExchangePyBase):
         # Convert trading pair to VALR format
         valr_pair = web_utils.convert_to_exchange_trading_pair(tracked_order.trading_pair)
         
-        # Prepare WebSocket cancel message (VALR expects "payload" not "data")
+        # Prepare WebSocket cancel message based on working test script
         cancel_message = WSJSONRequest(
             payload={
                 "type": CONSTANTS.WS_PLACE_CANCEL_ORDER_EVENT,
                 "clientMsgId": client_msg_id,
-                "payload": {  # Changed from "data" to "payload"
+                "payload": {  # VALR expects "payload" for the cancel details
                     "customerOrderId": order_id,
                     "pair": valr_pair
                 }
-            },
-            is_auth_required=True  # Enable authentication for order cancellation
+            }
+            # Note: is_auth_required removed - VALR authenticates during WebSocket handshake only
         )
         
         # Create future for response tracking

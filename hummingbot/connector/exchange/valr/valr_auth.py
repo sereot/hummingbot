@@ -120,12 +120,27 @@ class ValrAuth(AuthBase):
         According to VALR WebSocket API documentation, authentication is done
         via connection headers with proper HMAC-SHA512 signature.
         
+        IMPORTANT: VALR WebSocket authentication happens during the initial connection
+        handshake only. Individual messages sent after connection do NOT need authentication.
+        
         Args:
             request: The WebSocket request to authenticate
             
         Returns:
             The authenticated request
         """
+        # Check if this is a WSJSONRequest (message after connection)
+        # These don't need authentication as VALR authenticates during handshake only
+        from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest
+        if isinstance(request, WSJSONRequest):
+            # No authentication needed for individual WebSocket messages
+            return request
+        
+        # Only authenticate if request has headers attribute (connection requests)
+        if not hasattr(request, 'headers'):
+            # If no headers attribute, this is likely a message request, not a connection
+            return request
+            
         headers = {}
         if request.headers is not None:
             headers.update(request.headers)
@@ -134,7 +149,10 @@ class ValrAuth(AuthBase):
         timestamp = int(time.time() * 1000)
         
         # Extract WebSocket path from URL for signature generation
-        ws_path = request.url.split('api.valr.com')[-1] if 'api.valr.com' in request.url else '/ws/account'
+        if hasattr(request, 'url') and request.url:
+            ws_path = request.url.split('api.valr.com')[-1] if 'api.valr.com' in request.url else '/ws/account'
+        else:
+            ws_path = '/ws/account'
         
         # Generate signature using WebSocket path
         # VALR requires signing: timestamp + 'GET' + ws_path + ''

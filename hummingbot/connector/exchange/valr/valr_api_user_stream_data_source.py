@@ -393,8 +393,8 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         elif event_message.upper() == "PING":
                             # Send PONG response
                             pong_message = WSJSONRequest(
-                                payload={"type": "PONG"},
-                                is_auth_required=False  # PONG doesn't need auth
+                                payload={"type": "PONG"}
+                                # No auth needed - VALR authenticates during handshake only
                             )
                             await websocket_assistant.send(pong_message)
                             self.logger().debug("Sent PONG response to VALR")
@@ -415,10 +415,25 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                         # Check if this is an order response that needs routing
                         msg_type = event_message.get("type") if isinstance(event_message, dict) else None
                         
+                        # Enhanced logging for debugging
+                        if msg_type:
+                            self.logger().info(f"WebSocket message received - Type: {msg_type}, "
+                                             f"Has clientMsgId: {'clientMsgId' in event_message}, "
+                                             f"Pending futures: {len(self._order_response_futures)}")
+                            
+                            # Log full message for order-related types
+                            if msg_type in ["ORDER_PLACED", "ORDER_FAILED", "ORDER_PROCESSED", 
+                                           "PLACE_LIMIT_WS_RESPONSE", "PLACE_MARKET_WS_RESPONSE",
+                                           "CANCEL_ORDER_SUCCESS", "CANCEL_ORDER_FAILED",
+                                           "CANCEL_ORDER_WS_RESPONSE", "CANCEL_ORDER_RESPONSE",
+                                           "OPEN_ORDERS_UPDATE", "NEW_ACCOUNT_TRADE"]:
+                                self.logger().info(f"Order-related message: {json.dumps(event_message, indent=2)}")
+                        
                         if msg_type in ["ORDER_PLACED", "ORDER_FAILED", "ORDER_PROCESSED", 
                                        "CANCEL_ORDER_SUCCESS", "CANCEL_ORDER_FAILED",
                                        "MODIFY_ORDER_OUTCOME", "PLACE_LIMIT_WS_RESPONSE",
-                                       "PLACE_MARKET_WS_RESPONSE", "CANCEL_ORDER_WS_RESPONSE"]:
+                                       "PLACE_MARKET_WS_RESPONSE", "CANCEL_ORDER_WS_RESPONSE",
+                                       "CANCEL_ORDER_RESPONSE"]:
                             # Try to find clientMsgId in message
                             client_msg_id = event_message.get("clientMsgId")
                             if not client_msg_id and isinstance(event_message.get("data"), dict):
@@ -430,10 +445,13 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                                 future = self._order_response_futures.pop(client_msg_id)
                                 if not future.done():
                                     future.set_result(event_message)
-                                    self.logger().info(f"Routed {msg_type} response for clientMsgId: {client_msg_id}")
+                                    self.logger().info(f"✓ Successfully routed {msg_type} response for clientMsgId: {client_msg_id}")
                                 continue  # Don't put in output queue
                             elif client_msg_id:
-                                self.logger().debug(f"No pending future for {msg_type} with clientMsgId: {client_msg_id}")
+                                self.logger().warning(f"⚠️ No pending future for {msg_type} with clientMsgId: {client_msg_id}")
+                                self.logger().warning(f"Pending futures: {list(self._order_response_futures.keys())}")
+                            else:
+                                self.logger().warning(f"⚠️ Order response {msg_type} missing clientMsgId! Message: {event_message}")
                         
                         # Log received messages for debugging
                         self.logger().debug(f"Received user stream message: {event_message}")
@@ -541,8 +559,8 @@ class ValrAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 await asyncio.sleep(20)
                 try:
                     ping_message = WSJSONRequest(
-                        payload={"type": "PING"},
-                        is_auth_required=False  # PING doesn't need auth
+                        payload={"type": "PING"}
+                        # No auth needed - VALR authenticates during handshake only
                     )
                     await websocket_assistant.send(ping_message)
                     self.logger().debug("Sent PING message to VALR account WebSocket")
